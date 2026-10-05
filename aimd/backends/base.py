@@ -15,6 +15,19 @@ Adding a backend
 Unit contract: ``compute`` receives positions in bohr, shape (N, 3), and
 returns the energy in hartree and the gradient dE/dR in hartree / bohr,
 shape (N, 3). Forces are ``-gradient``.
+
+Density-guess protocol (SCF backends; used by XL-BOMD and guess reuse)
+---------------------------------------------------------------------
+A backend that sets ``supports_density_guess = True`` must:
+  - return its converged AO density in ``GradientResult.density``:
+    shape (nao, nao) total density for restricted references, or
+    shape (2, nao, nao) [alpha, beta] for unrestricted ones;
+  - accept an array of the same shape in ``set_density_guess``, to be used as
+    the starting density of the *next* ``compute`` call only.
+Backends that do not support it leave ``density`` as ``None``.
+
+Optional properties: ``GradientResult.dipole`` is the electronic + nuclear
+dipole moment in atomic units (e * bohr), shape (3,), or ``None``.
 """
 
 from __future__ import annotations
@@ -32,6 +45,8 @@ class GradientResult:
     energy: float                       # hartree
     gradient: np.ndarray                # hartree / bohr, (N, 3)
     converged: bool = True
+    density: np.ndarray | None = None   # AO density, see module docstring
+    dipole: np.ndarray | None = None    # e * bohr, (3,)
     info: dict[str, Any] = field(default_factory=dict)
 
     @property
@@ -43,6 +58,7 @@ class ForceBackend(ABC):
     """Abstract energy/gradient provider."""
 
     name: ClassVar[str] = ""
+    supports_density_guess: ClassVar[bool] = False
 
     def __init__(
         self,
@@ -57,6 +73,12 @@ class ForceBackend(ABC):
     @abstractmethod
     def compute(self, positions: np.ndarray) -> GradientResult:
         """Energy and gradient at ``positions`` (bohr, shape (N, 3))."""
+
+    def set_density_guess(self, density: np.ndarray) -> None:
+        """Starting density for the next ``compute`` call (SCF backends only)."""
+        raise NotImplementedError(
+            f"backend '{self.name}' does not support density guesses"
+        )
 
     def close(self) -> None:
         """Release external resources (scratch files, processes). Optional."""
