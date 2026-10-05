@@ -1,0 +1,13 @@
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+.pytest_cache/
+.venv/
+# run outputs
+trajectory.xyz
+energies.csv
+psi4_*.out
+*.clean
+timer.dat

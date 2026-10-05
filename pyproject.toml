@@ -1,0 +1,24 @@
+[build-system]
+requires = ["setuptools>=64"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "aimd"
+version = "0.1.0"
+description = "Ab initio (Born-Oppenheimer) molecular dynamics engine"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = ["numpy>=1.24"]
+
+[project.optional-dependencies]
+dev = ["pytest>=7"]
+# Psi4 is distributed through conda: conda install -c conda-forge psi4
+
+[project.scripts]
+aimd = "aimd.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["aimd*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
