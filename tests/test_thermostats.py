@@ -307,6 +307,52 @@ def test_baoab_samples_exact_harmonic_positions_per_coordinate():
     assert abs(v_mean.mean() - 1.0) > 5 * agg_se
 
 
+@pytest.mark.parametrize("make, max_se", [
+    (lambda b: CSVR(b, 1.0, T, tau_fs=3.0, rng=4), (0.015, 0.02, 0.035)),
+    (lambda b: NoseHooverChain(b, 1.0, T, period_fs=8.0, chain_length=4, n_mts=4,
+                               n_suzuki_yoshida=5), (0.01, 0.01, 0.025)),
+], ids=["csvr", "nhc"])
+def test_one_dof_bond_samples_the_exact_shadow_position_law(make, max_se):
+    """
+    A harmonic H2 bond (period 8 fs) with P = 0 and L = 0 has N_f = 1 (CSVR
+    then draws no chi^2 part), and global rescaling keeps v along the bond, so
+    the dynamics stays one-dimensional and the thermostat is ergodic. Around
+    Verlet it samples the canonical law of the shadow Hamiltonian: the stretch
+    x is Gaussian with <k_s x^2> = kT and <(k_s x^2)^2> = 3 (kT)^2, where
+    k_s = k (1 - (w h)^2 / 4) (exact for CSVR; NHC up to its chain splitting).
+    This checks the position distribution itself, not just <K>.
+    With w h = 0.79 the plain <k x^2> would be kT / 0.85, i.e. 0.18 kT off,
+    and the SE caps keep that more than 7 SE away. Tolerance 5 block SEs;
+    measured SEs: CSVR 0.010 / 0.012 / 0.023, NHC 0.006 / 0.006 / 0.016.
+    """
+    s = MolecularSystem(["H", "H"], [[0.0, 0.0, -0.7], [0.0, 0.0, 0.7]])
+    w = 2.0 * np.pi / (8.0 * FS_TO_AU_TIME)
+    k = 0.5 * s.masses[0] * w**2                        # reduced mass m_H / 2
+    e = np.zeros(6)
+    e[2], e[5] = 1.0, -1.0                              # z_2 - z_1
+    backend = HarmonicBackend(s.symbols, hessian=k * np.outer(e, e),
+                              reference_positions=s.positions)
+    k_s = k * (1.0 - (w * FS_TO_AU_TIME) ** 2 / 4)
+    s.velocities[:, 2] = np.array([1.0, -1.0]) * np.sqrt(KT / s.masses[0])
+    s.remove_com_motion()
+    s.remove_angular_momentum()
+    assert s.n_dof == 1
+    u = []
+    n_steps = 60000
+    res = run_md(s, make(backend), n_steps, callback=lambda _r: u.append(
+        k_s * (s.positions[1, 2] - s.positions[0, 2] - 1.4) ** 2 / KT))
+    assert np.all(s.velocities[:, :2] == 0.0)
+    burn = n_steps // 20
+    u = np.array(u)[burn:]
+    kin = res.column("kinetic_Eh")[burn:] / (KT / 2)
+    for (mean, se), cap in zip(
+        [(kin.mean(), block_se(kin)), (u.mean(), block_se(u)),
+         ((u**2).mean() / 3, block_se(u**2) / 3)], max_se,
+    ):
+        assert se < cap, (mean, se)
+        assert abs(mean - 1.0) < 5 * se, (mean, se)
+
+
 def test_global_thermostats_target_reduced_dof_and_keep_constraints(h4):
     """
     With P = 0 and L = 0 the H4 cluster has N_f = 6. CSVR, NHC and Berendsen

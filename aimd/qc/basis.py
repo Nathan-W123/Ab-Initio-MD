@@ -100,7 +100,7 @@ def normalized_contraction(l: int, exponents: np.ndarray, coefficients: np.ndarr
     return c / np.sqrt(c @ ovlp @ c)
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, eq=False)
 class Shell:
     """One segmented shell (read-only view for inspection and tests)."""
     atom: int
@@ -164,6 +164,10 @@ class BasisSet:
         x = np.array(positions, dtype=float).reshape(-1, 3)
         if x.shape[0] != self.natm:
             raise ValueError(f"expected {self.natm} positions, got {x.shape[0]}")
+        if not np.all(np.isfinite(x)):
+            # e.g. an MD run that blew up; the numba kernels have no bounds
+            # checks, so refuse here rather than produce garbage integrals
+            raise ValueError("atomic positions must be finite (got NaN or inf)")
         self.positions = _readonly(x)
         self._cache: dict = {}   # geometry-dependent data (shell pairs, Schwarz bounds)
 

@@ -10,7 +10,8 @@ checkpoint + restart + M steps is bit-for-bit the same as N + M steps:
   - the integrator's ``state_dict()``: its configuration, the cached
     GradientResult (energy, gradient, density, dipole, info), RNG bit-generator
     states and thermostat variables, including the accumulated thermostat
-    energy that enters the conserved quantity.
+    energy that enters the conserved quantity, and for XL-BOMD the auxiliary
+    density history (K+1 AO density matrices).
 
 Format: a NumPy ``.npz`` archive. Every array is stored as its own ``.npy``
 member (exact float64 / uint64 round trip) and the rest of the state is UTF-8
@@ -29,7 +30,7 @@ from __future__ import annotations
 import json
 import os
 import warnings
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
@@ -114,20 +115,33 @@ def _sanitize_info(state: dict[str, Any]) -> dict[str, Any]:
 
 @dataclass
 class Checkpoint:
+    """
+    A loaded checkpoint. ``system`` is a working copy that may be propagated
+    in place (``run_md(ckpt.system, integ, n, restart=ckpt)``); :meth:`restore`
+    always uses the state as it was saved, so the same checkpoint can be
+    restarted from more than once.
+    """
+
     system: MolecularSystem
     step: int
     time_fs: float
     integrator_state: dict[str, Any]
     backend: str = ""                   # name of the backend that wrote it (info)
+    _saved: MolecularSystem = field(init=False, repr=False, compare=False)
+
+    def __post_init__(self) -> None:
+        # Snapshot: running from ``self.system`` must not change what a later
+        # restore() puts back (the cached forces belong to these positions).
+        self._saved = self.system.copy()
 
     def restore(self, system: MolecularSystem, integrator: "Integrator") -> None:
         """Copy the saved state into ``system`` (in place) and ``integrator``."""
-        if list(system.symbols) != list(self.system.symbols):
+        src = self._saved
+        if list(system.symbols) != list(src.symbols):
             raise ValueError(
-                f"checkpoint atoms {self.system.symbols} != system atoms {system.symbols}"
+                f"checkpoint atoms {src.symbols} != system atoms {system.symbols}"
             )
         integrator.load_state_dict(self.integrator_state)   # validates first
-        src = self.system
         system.positions = src.positions.copy()
         system.velocities = src.velocities.copy()
         system.masses = src.masses.copy()
@@ -180,6 +194,8 @@ def save_checkpoint(
     tmp = path.with_name(path.name + ".tmp")
     with tmp.open("wb") as fh:            # a file object: savez adds no suffix
         np.savez(fh, **arrays)
+        fh.flush()
+        os.fsync(fh.fileno())             # data on disk before the rename
     os.replace(tmp, path)
     return path
 

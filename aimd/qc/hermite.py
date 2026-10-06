@@ -22,8 +22,10 @@ Coulomb-type integrals contract E with
     R^n_{000}     = (-2 alpha)^n F_n(alpha |R_PC|^2)
     R^n_{t+1,u,v} = t R^{n+1}_{t-1,u,v} + X_PC R^{n+1}_{t,u,v}     (same for u, v)
 
-and R_{tuv} = R^0_{tuv} = (d/dP_x)^t (d/dP_y)^u (d/dP_z)^v of the s-type
-Coulomb integral (2pi/p ... ) / F_0 kernel.
+so that R_{tuv} = R^0_{tuv} = (d/dP_x)^t (d/dP_y)^u (d/dP_z)^v F_0(alpha |R_PC|^2).
+Nuclear attraction: <a|1/r_C|b> = (2pi/p) sum_tuv E^{ab}_tuv R_tuv(p, P - C);
+electron repulsion: (ab|cd) = 2pi^(5/2) / (pq sqrt(p+q)) sum E^{ab}_tuv
+(-1)^(tau+nu+phi) E^{cd}_{tau nu phi} R_{t+tau,u+nu,v+phi}(pq/(p+q), P - Q).
 
 Hermite index (t, u, v) is linearized in order of increasing degree t+u+v,
 so the first NH(L) = (L+1)(L+2)(L+3)/6 indices are exactly those with
@@ -31,7 +33,9 @@ t+u+v <= L; HERM_IDX maps (t, u, v) back to the linear index.
 
 Cartesian component tables (PySCF order) and their normalization factors
 (see aimd.qc.basis) live here too, as module constants that numba freezes
-into the compiled kernels.
+into the compiled kernels. numba's disk cache does not track them (or the
+functions here) for kernels defined in integrals.py: after editing this
+file, delete aimd/qc/__pycache__ (see aimd.qc.integrals).
 """
 
 from __future__ import annotations
@@ -88,18 +92,14 @@ def _herm_tables():
         hdir[h] = d
         c1 = c.copy()
         c1[d] -= 1
-        hm1[h] = idx[tuv_key(c1)]
+        hm1[h] = idx[tuple(int(v) for v in c1)]
         if c[d] >= 2:
             c2 = c.copy()
             c2[d] -= 2
-            hm2[h] = idx[tuv_key(c2)]
+            hm2[h] = idx[tuple(int(v) for v in c2)]
             hrc[h] = c[d] - 1
     sign = np.where(tuv.sum(axis=1) % 2 == 0, 1.0, -1.0)
     return tuv, idx, hdir, hm1, hm2, hrc, sign
-
-
-def tuv_key(c):
-    return int(c[0]), int(c[1]), int(c[2])
 
 
 HERM_TUV, HERM_IDX, HERM_DIR, HERM_M1, HERM_M2, HERM_RC, HERM_SIGN = _herm_tables()

@@ -24,7 +24,7 @@ import pytest
 pytest.importorskip("pyscf")
 from pyscf import gto, scf  # noqa: E402
 
-from aimd.qc.basis import BasisSet  # noqa: E402
+from aimd.qc.basis import BasisSet, normalized_contraction  # noqa: E402
 from aimd.qc.basis_data import BASIS_SETS  # noqa: E402
 from aimd.units import ANG_TO_BOHR  # noqa: E402
 
@@ -48,11 +48,39 @@ _MOLECULES_ANG: dict[str, tuple[list[str], list[list[float]]]] = {
                  [-1.9237, 0.3850, 0.0], [2.0985, 0.2306, 0.0], [1.1184, -1.0093, 0.8869],
                  [1.1184, -1.0093, -0.8869], [0.0598, 1.1956, 0.8834],
                  [0.0598, 1.1956, -0.8834]]),
+    # Near-experimental equilibrium structures (bond lengths within ~0.01 A), used
+    # by the SCF tests; the references are computed at exactly these geometries.
+    "h2": (["H", "H"], [[0.0, 0.0, 0.0], [0.0, 0.0, 0.7414]]),
+    "hf": (["F", "H"], [[0.0, 0.0, 0.0], [0.0, 0.0, 0.9168]]),
+    "n2": (["N", "N"], [[0.0, 0.0, 0.0], [0.0, 0.0, 1.0977]]),
+    "ch4": (["C", "H", "H", "H", "H"],
+            [[0.0, 0.0, 0.0], [0.6276, 0.6276, 0.6276], [-0.6276, -0.6276, 0.6276],
+             [-0.6276, 0.6276, -0.6276], [0.6276, -0.6276, -0.6276]]),
+    "hcn": (["H", "C", "N"], [[0.0, 0.0, -1.0655], [0.0, 0.0, 0.0], [0.0, 0.0, 1.1532]]),
+    "formaldehyde": (["C", "O", "H", "H"],
+                     [[0.0, 0.0, 0.0], [0.0, 0.0, 1.2033], [0.0, 0.9339, -0.5821],
+                      [0.0, -0.9339, -0.5821]]),
+    "oh": (["O", "H"], [[0.0, 0.0, 0.0], [0.0, 0.0, 0.9697]]),
+    "ch2": (["C", "H", "H"], [[0.0, 0.0, 0.1], [0.0, 0.9896, -0.3207], [0.0, -0.9896, -0.3207]]),
+    "o2": (["O", "O"], [[0.0, 0.0, 0.0], [0.0, 0.0, 1.2075]]),
+    "no": (["N", "O"], [[0.0, 0.0, 0.0], [0.0, 0.0, 1.1508]]),
+    "cn": (["C", "N"], [[0.0, 0.0, 0.0], [0.0, 0.0, 1.1718]]),
+    "c2h4": (["C", "C", "H", "H", "H", "H"],
+             [[0.0, 0.0, 0.6695], [0.0, 0.0, -0.6695], [0.0, 0.9289, 1.2321],
+              [0.0, -0.9289, 1.2321], [0.0, 0.9289, -1.2321], [0.0, -0.9289, -1.2321]]),
+    "ch3oh": (["C", "O", "H", "H", "H", "H"],
+              [[-0.0467, 0.6634, 0.0], [-0.0467, -0.7570, 0.0], [-1.0919, 0.9767, 0.0],
+               [0.4342, 1.0732, 0.8938], [0.4342, 1.0732, -0.8938], [0.8651, -1.0861, 0.0]]),
 }
 
 
 def molecule(name: str, distort: float = 0.0, seed: int = 0) -> tuple[list[str], np.ndarray]:
-    """(symbols, positions in bohr); ``distort`` > 0 adds a seeded random displacement (bohr)."""
+    """
+    (symbols, positions in bohr) of ``name`` (a key of _MOLECULES_ANG: water,
+    ammonia, hcl, h2s, nh2, ethanol, h2, hf, n2, ch4, hcn, formaldehyde, oh,
+    ch2, o2, no, cn, c2h4, ch3oh); ``distort`` > 0 adds a seeded random
+    displacement (bohr).
+    """
     sym, xyz = _MOLECULES_ANG[name]
     pos = np.array(xyz) * ANG_TO_BOHR
     if distort:
@@ -82,6 +110,40 @@ def pyscf_mole(basis: BasisSet, charge: int = 0, spin: int | None = None) -> gto
     mol.build(atom=atom, basis=data, unit="Bohr", cart=True, charge=charge,
               spin=(nelec % 2) if spin is None else spin, verbose=0)
     return mol
+
+
+def custom_basis(symbols: list[str], positions: np.ndarray, data: dict, charge: int = 0,
+                 spin: int | None = None) -> tuple[BasisSet, gto.Mole]:
+    """
+    Our BasisSet and the matching Cartesian PySCF Mole for basis data given
+    in PySCF's format, {symbol: [[l, [exp, c1, c2, ...], ...], ...]} (extra
+    coefficient columns = general contraction), e.g. a standard basis from
+    BASIS_SETS plus extra diffuse shells. Shells are laid out as
+    ``build_basis`` lays them out (checked against PySCF's AO order).
+    """
+    shell_atom, shell_l, shell_prim, prim_exp, prim_coef = [], [], [0], [], []
+    for a, sym in enumerate(symbols):
+        for entry in sorted(data[sym], key=lambda sh: sh[0]):
+            l = int(entry[0])
+            rows = np.array(entry[1:], dtype=float)
+            for col in range(1, rows.shape[1]):
+                keep = rows[:, col] != 0.0
+                exps = rows[keep, 0]
+                shell_atom.append(a)
+                shell_l.append(l)
+                prim_exp.extend(exps)
+                prim_coef.extend(normalized_contraction(l, exps, rows[keep, col]))
+                shell_prim.append(len(prim_exp))
+    pos = np.asarray(positions, dtype=float)
+    basis = BasisSet("custom", symbols, pos, np.array(shell_atom), np.array(shell_l),
+                     np.array(shell_prim), np.array(prim_exp), np.array(prim_coef))
+    nelec = int(basis.atomic_numbers.sum()) - charge
+    mol = gto.Mole()
+    mol.build(atom=[(s, tuple(map(float, x))) for s, x in zip(symbols, pos)],
+              basis={s: data[s] for s in set(symbols)}, unit="Bohr", cart=True, charge=charge,
+              spin=(nelec % 2) if spin is None else spin, verbose=0)
+    assert_same_aos(basis, mol)
+    return basis, mol
 
 
 def _dfact(n: int) -> int:
@@ -139,11 +201,19 @@ def random_symmetric(n: int, rng: np.random.Generator, scale: float = 0.5) -> np
     return A + A.T
 
 
-def run_scf(mol: gto.Mole, unrestricted: bool = False, conv_tol: float = 1e-12):
-    """Converged PySCF RHF/UHF object."""
+def run_scf(mol: gto.Mole, unrestricted: bool = False, conv_tol: float = 1e-12, dm0=None,
+            conv_tol_grad: float | None = None):
+    """
+    Converged PySCF RHF/UHF object, optionally started from the PySCF-normalized
+    density ``dm0``. PySCF's orbital-gradient threshold defaults to
+    sqrt(conv_tol) (1e-6 here): pass ``conv_tol_grad`` when comparing densities,
+    orbitals or properties more tightly than that.
+    """
     mf = (scf.UHF if unrestricted else scf.RHF)(mol)
     mf.conv_tol = conv_tol
-    mf.kernel()
+    if conv_tol_grad is not None:
+        mf.conv_tol_grad = conv_tol_grad
+    mf.kernel(dm0=dm0)
     assert mf.converged
     return mf
 

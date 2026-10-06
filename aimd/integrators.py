@@ -12,6 +12,10 @@ and caches that result so the next step can reuse it.
   NoseHooverChain  - VelocityVerlet + MTK Nose-Hoover chain (canonical)
   LangevinBAOAB    - NVT; BAOAB splitting of Leimkuhler & Matthews (2013),
                      which gives accurate configurational sampling at large dt
+  XLBOMD           - VelocityVerlet (NVE, or with any of the velocity
+                     thermostats) whose SCF guesses come from the dissipative
+                     extended-Lagrangian auxiliary density of Niklasson et al.,
+                     J. Chem. Phys. 130, 214109 (2009); see aimd.xlbomd
 
 Each integrator reports a conserved quantity, ``conserved_energy(system)``:
 E_pot + E_kin for NVE, the extended Hamiltonian for Nose-Hoover chains, and the
@@ -44,6 +48,7 @@ from aimd.thermostats import (
     thermostat_from_config,
 )
 from aimd.units import FS_TO_AU_TIME, KB_AU
+from aimd.xlbomd import AuxiliaryDensity
 
 
 def _result_state(result: GradientResult | None) -> dict[str, Any] | None:
@@ -140,14 +145,17 @@ class Integrator(ABC):
                 f"cannot load {state.get('integrator')!r} state into "
                 f"{type(self).__name__}"
             )
-        self.result = _result_from_state(state["result"])
+        result = _result_from_state(state["result"])
         # An SCF backend would have started the next step from this density.
+        # Handed over before ``self.result`` changes: the backend validates
+        # its shape, and a rejected state must leave the integrator untouched.
         if (
-            self.result is not None
-            and self.result.density is not None
+            result is not None
+            and result.density is not None
             and self.backend.supports_density_guess
         ):
-            self.backend.set_density_guess(self.result.density)
+            self.backend.set_density_guess(result.density)
+        self.result = result
 
 
 class VelocityVerlet(Integrator):
@@ -208,11 +216,15 @@ class VelocityVerlet(Integrator):
             thermo.begin_step(system, dt)
         system.velocities += 0.5 * dt * self._accel(system)
         system.positions += dt * system.velocities
-        self.result = self.backend.compute(system.positions)
+        self.result = self._compute(system)
         system.velocities += 0.5 * dt * self._accel(system)
         if thermo is not None:
             thermo.end_step(system, dt)
         return self.result
+
+    def _compute(self, system: MolecularSystem) -> GradientResult:
+        """Forces at the new positions (hook for the SCF guess in XLBOMD)."""
+        return self.backend.compute(system.positions)
 
     def thermostat_energy(self) -> float:
         return 0.0 if self.thermostat is None else self.thermostat.energy()
@@ -239,6 +251,11 @@ class VelocityVerlet(Integrator):
         theirs = None if saved is None else saved.get("type")
         if mine != theirs:
             raise ValueError(f"checkpoint thermostat {theirs!r} != integrator's {mine!r}")
+        if saved is not None:
+            # Validate on a scratch copy first (e.g. a different chain length),
+            # so that a rejected state does not leave ``result`` replaced.
+            probe = thermostat_from_config(mine, self.thermostat.config())
+            probe.load_state_dict(saved)
         super().load_state_dict(state)
         if saved is not None:
             self.thermostat.load_state_dict(saved)
@@ -294,6 +311,95 @@ class NoseHooverChain(VelocityVerlet):
 
     def config(self) -> dict[str, Any]:
         return {"timestep_fs": self.timestep_fs, **self.thermostat.config()}
+
+
+class XLBOMD(VelocityVerlet):
+    """
+    Extended-Lagrangian BOMD with dissipation (Niklasson et al., J. Chem.
+    Phys. 130, 214109 (2009)).
+
+    The nuclei follow velocity Verlet exactly as in :class:`VelocityVerlet`
+    (NVE, or NVT with ``thermostat`` / the Berendsen arguments). Before each
+    force call the auxiliary density is advanced,
+
+        P(t+dt) = 2 P(t) - P(t-dt) + kappa (D(t) - P(t)) + alpha sum_k c_k P(t-k dt),
+
+    with D(t) the SCF density of the current step, and handed to
+    ``backend.set_density_guess`` as the starting density of the SCF at
+    R(t+dt). The history is initialised from the first SCF density. ``k`` is
+    the dissipation order K (3..9) of the coefficient table in aimd.xlbomd.
+
+    The backend must implement the density-guess protocol
+    (``supports_density_guess``); restricted (nao, nao) and unrestricted
+    (2, nao, nao) densities both work. The auxiliary density enters the
+    extended Lagrangian with a mass that is taken to zero (Niklasson, Phys.
+    Rev. Lett. 100, 123004 (2008)), so it carries no energy and the conserved
+    quantity is that of the wrapped Verlet scheme, E_pot + E_kin [+ thermostat
+    term]. Langevin dynamics is not combined with XL-BOMD here.
+    """
+
+    def __init__(
+        self,
+        backend: ForceBackend,
+        timestep_fs: float,
+        k: int = 5,
+        temperature_k: float | None = None,
+        berendsen_tau_fs: float | None = None,
+        *,
+        thermostat: Thermostat | None = None,
+    ) -> None:
+        if not getattr(backend, "supports_density_guess", False):
+            raise ValueError(
+                f"XL-BOMD needs a backend that accepts SCF density guesses "
+                f"(supports_density_guess = True); backend "
+                f"{getattr(backend, 'name', type(backend).__name__)!r} does not"
+            )
+        self.aux = AuxiliaryDensity(k)    # validates k before anything else
+        super().__init__(
+            backend, timestep_fs, temperature_k, berendsen_tau_fs, thermostat=thermostat
+        )
+
+    @property
+    def k(self) -> int:
+        return self.aux.k
+
+    def initialize(self, system: MolecularSystem) -> GradientResult:
+        result = super().initialize(system)
+        self.aux.reset(self._density(result))
+        return result
+
+    def _density(self, result: GradientResult) -> np.ndarray:
+        if result.density is None:
+            raise RuntimeError(
+                f"backend {self.backend.name!r} returned no SCF density, "
+                "which XL-BOMD needs"
+            )
+        return result.density
+
+    def _compute(self, system: MolecularSystem) -> GradientResult:
+        if not self.aux.initialized:
+            self.aux.reset(self._density(self.result))
+        guess = self.aux.propagate(self._density(self.result))
+        self.backend.set_density_guess(guess)
+        return self.backend.compute(system.positions)
+
+    def config(self) -> dict[str, Any]:
+        return {**super().config(), "k": self.k}
+
+    def state_dict(self) -> dict[str, Any]:
+        return {**super().state_dict(), "xl": self.aux.state_dict()}
+
+    def load_state_dict(self, state: dict[str, Any]) -> None:
+        aux = AuxiliaryDensity(self.k)
+        if state.get("integrator") == type(self).__name__:
+            aux.load_state_dict(state["xl"])               # validates K
+            density = (state.get("result") or {}).get("density")
+            if aux.initialized and (
+                density is None or np.shape(density) != aux.current.shape
+            ):
+                raise ValueError("XL-BOMD history does not match the saved SCF density")
+        super().load_state_dict(state)                     # validates the rest
+        self.aux = aux
 
 
 class LangevinBAOAB(Integrator):
@@ -370,7 +476,8 @@ class LangevinBAOAB(Integrator):
 
 
 INTEGRATORS: dict[str, type[Integrator]] = {
-    cls.__name__: cls for cls in (VelocityVerlet, CSVR, NoseHooverChain, LangevinBAOAB)
+    cls.__name__: cls
+    for cls in (VelocityVerlet, CSVR, NoseHooverChain, LangevinBAOAB, XLBOMD)
 }
 
 

@@ -41,6 +41,12 @@ over a fixed number of work chunks, so results are bitwise identical for any
 thread count. Shell-pair data and Schwarz bounds are cached on the BasisSet
 (i.e. per geometry) and shared by eri_tensor and two_electron_gradient.
 
+Compiled-code cache: numba's on-disk cache (``cache=True``) is keyed on the
+file that defines each kernel. The kernels here embed compiled copies of
+hermite.py / boys.py functions and their module-level tables, so editing
+only hermite.py, boys.py or basis.py does NOT recompile them; delete
+aimd/qc/__pycache__ (or touch this file) after such an edit.
+
 Gradient contractions (all return d/dR_A, shape (natm, 3), hartree/bohr)
 ----------------------------------------------------------------------
 Densities are AO matrices in this basis; they must be symmetric (they are
@@ -102,6 +108,11 @@ from aimd.qc.hermite import (
 _PI = math.pi
 _TWO_PI_2_5 = 2.0 * math.pi ** 2.5
 DEFAULT_SCHWARZ = 1e-12
+# The Schwarz bound is not strict for derivative integrals (they carry extra
+# factors ~2a); measured on ethanol/6-31G* with an RHF density, screening the
+# gradient at Q Q max|Gamma| < 1e-12 / 1e-13 / 1e-14 gives max errors of
+# 1.2e-10 / 9e-12 / 4e-13 Eh/bohr, at no measurable cost difference.
+DEFAULT_SCHWARZ_GRAD = 1e-14
 MAX_NAO_ERI = 120
 
 
@@ -215,10 +226,10 @@ def _herm3(E, ax, ay, az, bx, by, bz, h):
 
 
 @njit(cache=True)
-def _dherm3(E, ax, ay, az, bx, by, bz, h, d, expo, on_a):
+def _dherm3_a(E, ax, ay, az, bx, by, bz, h, d, a):
     """
-    Hermite coefficient of d/dA_d (on_a) or d/dB_d (not on_a) of the
-    Gaussian product, via d/dA_x g_i = 2a g_{i+1} - i g_{i-1}.
+    Hermite coefficient h of d/dA_d of the Gaussian product (exponent a on
+    center A), via d/dA_x g_i = 2a g_{i+1} - i g_{i-1}; E must hold i <= l_a + 1.
     """
     t = HERM_TUV[h, 0]
     u = HERM_TUV[h, 1]
@@ -227,35 +238,19 @@ def _dherm3(E, ax, ay, az, bx, by, bz, h, d, expo, on_a):
     ey = E[1, ay, by, u]
     ez = E[2, az, bz, v]
     if d == 0:
-        if on_a:
-            dx = 2.0 * expo * E[0, ax + 1, bx, t]
-            if ax > 0:
-                dx -= ax * E[0, ax - 1, bx, t]
-        else:
-            dx = 2.0 * expo * E[0, ax, bx + 1, t]
-            if bx > 0:
-                dx -= bx * E[0, ax, bx - 1, t]
+        dx = 2.0 * a * E[0, ax + 1, bx, t]
+        if ax > 0:
+            dx -= ax * E[0, ax - 1, bx, t]
         return dx * ey * ez
     elif d == 1:
-        if on_a:
-            dy = 2.0 * expo * E[1, ay + 1, by, u]
-            if ay > 0:
-                dy -= ay * E[1, ay - 1, by, u]
-        else:
-            dy = 2.0 * expo * E[1, ay, by + 1, u]
-            if by > 0:
-                dy -= by * E[1, ay, by - 1, u]
+        dy = 2.0 * a * E[1, ay + 1, by, u]
+        if ay > 0:
+            dy -= ay * E[1, ay - 1, by, u]
         return ex * dy * ez
-    else:
-        if on_a:
-            dz = 2.0 * expo * E[2, az + 1, bz, v]
-            if az > 0:
-                dz -= az * E[2, az - 1, bz, v]
-        else:
-            dz = 2.0 * expo * E[2, az, bz + 1, v]
-            if bz > 0:
-                dz -= bz * E[2, az, bz - 1, v]
-        return ex * ey * dz
+    dz = 2.0 * a * E[2, az + 1, bz, v]
+    if az > 0:
+        dz -= az * E[2, az - 1, bz, v]
+    return ex * ey * dz
 
 
 @njit(cache=True)
@@ -470,7 +465,7 @@ def _nuclear_grad_kernel(shell_atom, shell_l, shell_prim, shell_ao, prim_exp, pr
                                 dE[h] += w * _herm3(E, ix, iy, iz, jx, jy, jz, h)
                             for h in range(nh1):
                                 for d in range(3):
-                                    dA[d, h] += w * _dherm3(E, ix, iy, iz, jx, jy, jz, h, d, a, True)
+                                    dA[d, h] += w * _dherm3_a(E, ix, iy, iz, jx, jy, jz, h, d, a)
                     px = (a * positions[ai, 0] + b * positions[aj, 0]) / p
                     py = (a * positions[ai, 1] + b * positions[aj, 1]) / p
                     pz = (a * positions[ai, 2] + b * positions[aj, 2]) / p
@@ -512,10 +507,17 @@ def _nuclear_grad_kernel(shell_atom, shell_l, shell_prim, shell_ao, prim_exp, pr
 # 1e-15 (cf. libcint's ``expcutoff``).
 PRIM_CUTOFF = 50.0
 # Fixed number of work chunks for the parallel quartet loops: chunk c owns the
-# bra pairs c, c + NCHUNK, ... (interleaved for load balance). Partial
-# gradients are summed per chunk in a fixed order, so results do not depend
-# on the number of threads.
+# bra pairs f, f + NCHUNK, f + 2 NCHUNK, ... with f = CHUNK_FIRST[c]
+# (interleaved for load balance). Partial gradients are summed per chunk in a
+# fixed order, so results do not depend on the number of threads.
 NCHUNK = 64
+# numba's OpenMP backend gives each of T threads a contiguous block of
+# NCHUNK / T chunks. With f = c, a molecule with fewer than NCHUNK / T shell
+# pairs (water / STO-3G: 15) had all its work in thread 0's block, i.e. ran
+# serially. The 6-bit reversal f = rev(c) gives every block the residues
+# f = r (mod T) for one r per thread (T = 2, 4, 8, ...), so small and large
+# molecules alike are spread over all threads.
+CHUNK_FIRST = np.array([int(f"{c:06b}"[::-1], 2) for c in range(NCHUNK)], dtype=np.int64)
 
 
 @njit(cache=True)
@@ -568,7 +570,11 @@ def _build_pairs(shell_atom, shell_l, shell_prim, prim_exp, prim_coef, positions
                     b = prim_exp[kb]
                     p = a + b
                     mu = a * b / p
-                    if mu * r2 > PRIM_CUTOFF:
+                    # exact negation of the counting test above: with a NaN
+                    # coordinate both comparisons are False, and "mu r2 >
+                    # cutoff" would write past the npp allocated pairs
+                    # (numba does no bounds checking -> heap corruption)
+                    if not mu * r2 <= PRIM_CUTOFF:
                         continue
                     pp_ab[k, 0] = a
                     pp_ab[k, 1] = b
@@ -747,15 +753,18 @@ def _eri_block(pb, pk, pair_pp, pair_shells, shell_l, pp_ab, pp_P, pp_E,
 
 @njit(cache=True)
 def _scratch(lmax, maxpp, deriv):
-    """Work arrays sized for the largest shell quartet."""
+    """
+    Work arrays sized for the largest shell quartet. Uninitialized: every
+    kernel writes the part it uses before reading it.
+    """
     nc = (lmax + 1) * (lmax + 2) // 2
     nhp = NHERM[2 * lmax + deriv]
     nR = NHERM[4 * lmax + deriv]
-    block = np.zeros((nc * nc, nc * nc))
-    Ek = np.zeros((maxpp, NHERM[2 * lmax], nc * nc))
-    X = np.zeros((nhp, nc * nc))
-    RR = np.zeros((2, nR))
-    hidx = np.zeros((nhp, NHERM[2 * lmax]), dtype=np.int64)
+    block = np.empty((nc * nc, nc * nc))
+    Ek = np.empty((maxpp, NHERM[2 * lmax], nc * nc))
+    X = np.empty((nhp, nc * nc))
+    RR = np.empty((2, nR))
+    hidx = np.empty((nhp, NHERM[2 * lmax]), dtype=np.int64)
     return block, Ek, X, RR, hidx
 
 
@@ -767,13 +776,16 @@ def _pair_ncart(ip, pair_shells, shell_l):
 
 
 @njit(cache=True, parallel=True)
-def _schwarz_kernel(pair_pp, pair_shells, shell_l, pp_ab, pp_P, pp_E, lmax, maxpp, nchunk):
+def _schwarz_kernel(pair_pp, pair_shells, shell_l, pp_ab, pp_P, pp_E, lmax, maxpp, chunk_first):
     """Q[ij] = max_ab |(ab|ab)|^(1/2) over each shell pair."""
     npair = pair_shells.shape[0]
+    nchunk = chunk_first.shape[0]
     Q = np.zeros(npair)
     for c in prange(nchunk):
+        if chunk_first[c] >= npair:
+            continue
         block, Ek, X, RR, hidx = _scratch(lmax, maxpp, 0)
-        for ip in range(c, npair, nchunk):
+        for ip in range(chunk_first[c], npair, nchunk):
             _eri_block(ip, ip, pair_pp, pair_shells, shell_l, pp_ab, pp_P, pp_E,
                        block, Ek, X, RR, hidx)
             m = 0.0
@@ -785,16 +797,19 @@ def _schwarz_kernel(pair_pp, pair_shells, shell_l, pp_ab, pp_P, pp_E, lmax, maxp
 
 @njit(cache=True, parallel=True)
 def _eri_tensor_kernel(pair_pp, pair_shells, shell_l, shell_ao, pp_ab, pp_P, pp_E,
-                       lmax, maxpp, Q, threshold, nchunk, eri):
+                       lmax, maxpp, Q, threshold, chunk_first, eri):
     """
     Writes (mn|ls) and its bra/ket-internal permutations for unique quartets
     (bra pair >= ket pair), halving diagonal (bra == ket) quartets;
     _symmetrize_pairs then adds the bra-ket transpose.
     """
     npair = pair_shells.shape[0]
+    nchunk = chunk_first.shape[0]
     for c in prange(nchunk):
+        if chunk_first[c] >= npair:
+            continue
         block, Ek, X, RR, hidx = _scratch(lmax, maxpp, 0)
-        for p1 in range(c, npair, nchunk):
+        for p1 in range(chunk_first[c], npair, nchunk):
             for p2 in range(p1 + 1):
                 if Q[p1] * Q[p2] < threshold:
                     continue
@@ -867,7 +882,7 @@ def schwarz_bounds(basis: BasisSet) -> np.ndarray:
     if Q is None:
         pr = _pairs(basis)
         Q = _schwarz_kernel(pr.pair_pp, pr.pair_shells, basis.shell_l, pr.pp_ab, pr.pp_P,
-                            pr.pp_E, basis.lmax, pr.maxpp, NCHUNK)
+                            pr.pp_E, basis.lmax, pr.maxpp, CHUNK_FIRST)
         basis._cache["schwarz"] = Q
     return Q
 
@@ -890,7 +905,7 @@ def eri_tensor(basis: BasisSet, schwarz_threshold: float = DEFAULT_SCHWARZ,
     eri = np.zeros((n, n, n, n))
     _eri_tensor_kernel(pr.pair_pp, pr.pair_shells, basis.shell_l, basis.shell_ao, pr.pp_ab,
                        pr.pp_P, pr.pp_E, basis.lmax, pr.maxpp, Q,
-                       float(schwarz_threshold), NCHUNK, eri)
+                       float(schwarz_threshold), CHUNK_FIRST, eri)
     _symmetrize_pairs(eri.reshape(n * n, n * n))
     return eri
 
@@ -1106,20 +1121,23 @@ def _grad_pass(pb, pk, G, pair_pp, pair_shells, shell_l, pp_ab, pp_P, pp_E,
 
 @njit(cache=True, parallel=True)
 def _eri_grad_kernel(pair_pp, pair_shells, shell_l, shell_atom, shell_ao, pp_ab, pp_P, pp_E,
-                     lmax, maxpp, Q, threshold, Dc, Dx, kfac, nchunk, grad_parts):
+                     lmax, maxpp, Q, threshold, Dc, Dx, kfac, chunk_first, grad_parts):
     npair = pair_shells.shape[0]
+    nchunk = chunk_first.shape[0]
     nx = Dx.shape[0]
     nc = (lmax + 1) * (lmax + 2) // 2
     for chunk in prange(nchunk):
+        if chunk_first[chunk] >= npair:
+            continue
         _blk, Ek, X, RR, hidx = _scratch(lmax, maxpp, 1)
-        Gk = np.zeros((maxpp, nc * nc, NHERM[2 * lmax]))
-        Y = np.zeros((nc * nc, NHERM[2 * lmax + 1]))
-        G = np.zeros((nc * nc, nc * nc))
-        Gt = np.zeros((nc * nc, nc * nc))
+        Gk = np.empty((maxpp, nc * nc, NHERM[2 * lmax]))
+        Y = np.empty((nc * nc, NHERM[2 * lmax + 1]))
+        G = np.empty((nc * nc, nc * nc))
+        Gt = np.empty((nc * nc, nc * nc))
         gab = np.zeros((2, 3))
         gcd = np.zeros((2, 3))
         grad = grad_parts[chunk]
-        for pb in range(chunk, npair, nchunk):
+        for pb in range(chunk_first[chunk], npair, nchunk):
             si = pair_shells[pb, 0]
             sj = pair_shells[pb, 1]
             oi = shell_ao[si]
@@ -1339,12 +1357,12 @@ def one_electron_gradient(basis: BasisSet, D: np.ndarray, W: np.ndarray,
 
 def two_electron_gradient(basis: BasisSet, D_coulomb: np.ndarray,
                           D_exchange_list: Sequence[np.ndarray], k_factor: float,
-                          schwarz_threshold: float = DEFAULT_SCHWARZ) -> np.ndarray:
+                          schwarz_threshold: float = DEFAULT_SCHWARZ_GRAD) -> np.ndarray:
     """
     d/dR of E2 = 1/2 sum Dc_mn Dc_ls (mn|ls) - k/2 sum_s sum Ds_ml Ds_ns (mn|ls)
     at fixed densities, (natm, 3). Quartets with Q_ab Q_cd max|Gamma| below
     ``schwarz_threshold`` are skipped (Gamma = the quartet's two-particle
-    density).
+    density); see DEFAULT_SCHWARZ_GRAD for the resulting error.
     """
     _check_lmax(basis)
     n = basis.nao
@@ -1357,6 +1375,6 @@ def two_electron_gradient(basis: BasisSet, D_coulomb: np.ndarray,
     parts = np.zeros((NCHUNK, basis.natm, 3))
     _eri_grad_kernel(pr.pair_pp, pr.pair_shells, basis.shell_l, basis.shell_atom,
                      basis.shell_ao, pr.pp_ab, pr.pp_P, pr.pp_E, basis.lmax,
-                     pr.maxpp, Q, float(schwarz_threshold), Dc, Dx, float(k_factor), NCHUNK,
-                     parts)
+                     pr.maxpp, Q, float(schwarz_threshold), Dc, Dx, float(k_factor),
+                     CHUNK_FIRST, parts)
     return parts.sum(axis=0)

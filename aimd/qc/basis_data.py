@@ -39,17 +39,18 @@ to PySCF's (shortest round-trip float repr) and the 6-31G* / 6-31G** shells
 equal PySCF's "6-31g*" / "6-31g**" entries exactly. Problems found in the
 HF-SCF-Engine sources:
 
-  - STO-3G Na-Ar: wrong exponents and 2s/2p contraction coefficients reused
-    for the n = 3 shells (the 3sp contraction differs).
-  - 6-31G Li-Ne (except C): the C core/valence contraction coefficients had
-    been reused; N, F, Ne exponents were also off by up to 9 %.
-  - 6-31G Na-Ar: wrong shell structure (the 6-primitive 2sp shell was
-    missing; the 3sp shell had 2-3 primitives instead of 3).
+  - STO-3G Na-Ar: wrong exponents, and the 2sp contraction coefficients
+    reused for the 3sp shell (whose contraction differs).
+  - 6-31G Li-Ne (all but C): carbon's 1s contraction coefficients reused for
+    every element, other valence coefficients and exponents off as well
+    (exponents by up to 9 %, Ne).
+  - 6-31G Na-Ar: wrong shell structure and exponents (2sp shell with 3
+    primitives instead of 6; Na/Mg 3sp shell with 2 instead of 3).
   - cc-pVDZ (basis_cache.json): only the first column of each general
     contraction was kept, so e.g. O had [2s1p1d] instead of [3s2p1d]; the Ar
     d shell was corrupt (677 primitives). The first cache column of every s
-    and p shell lies in the span of the shells below to 1e-15 (relative
-    least-squares residual), i.e. both sources describe the same basis.
+    and p shell lies in the span of the same-l shells below (relative
+    least-squares residual < 1e-15), i.e. both sources describe one basis.
     PySCF stores the "optimized" general contraction (the most diffuse
     s/p primitive is dropped from the contracted columns because it is also
     a separate shell); this spans exactly the same space as the original

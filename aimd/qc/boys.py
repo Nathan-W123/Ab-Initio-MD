@@ -21,8 +21,15 @@ Wiley 2000, sec. 9.8.2):
         F_{n+1}(x) = ((2n + 1) F_n(x) - exp(-x)) / (2x),
     which is stable while 2n + 1 < 2x (guaranteed: nmax <= NMAX < X_SWITCH).
     For x >= X_SWITCH the downward recursion is stable as well, so callers
-    can always compute the highest order once (``boys_top``) and recurse
-    downwards.
+    can compute the highest order once (``boys_top``) and recurse downwards
+    -- as long as F_nmax(x) ~ (2n-1)!! sqrt(pi) / (2^(n+1) x^(n+1/2)) is a
+    normal double. It becomes subnormal (and then zero, which the downward
+    recursion would propagate to every lower order) for x > 3e10 at n = 32,
+    x > 2e18 at n = 17 and x > 8e32 at n = 9. The integral kernels need
+    n <= 4 l_max + 1 (9 for d shells, 17 for g shells) with x = alpha R^2,
+    alpha <= 3e5 bohr^-2 for the bases here, so this needs R > 1e6 bohr even
+    for g shells; ``boys_into`` recurses upward from F_0 for x >= X_SWITCH
+    and is accurate for any x.
 
 The grid table is built once at import from the convergent series
     F_n(x) = exp(-x) sum_k (2x)^k / ((2n+1)(2n+3)...(2n+2k+1))
@@ -110,6 +117,18 @@ def boys_top(n: int, x: float) -> float:
 @njit(cache=True)
 def boys_into(nmax: int, x: float, out: np.ndarray) -> None:
     """Write F_0(x)..F_nmax(x) into ``out[0:nmax+1]`` (nmax <= NMAX)."""
+    if x >= X_SWITCH:
+        # upward from F_0 (stable here, see the module docstring): recursing
+        # down from F_nmax would turn an underflowed F_nmax (x > 3e10 for
+        # nmax = 32) into F_n = 0 for every n
+        f = 0.5 * math.sqrt(math.pi / x)
+        out[0] = f
+        ex = math.exp(-x)
+        inv2x = 0.5 / x
+        for n in range(nmax):
+            f = ((2 * n + 1) * f - ex) * inv2x
+            out[n + 1] = f
+        return
     f = boys_top(nmax, x)
     out[nmax] = f
     if nmax > 0:

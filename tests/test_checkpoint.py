@@ -10,9 +10,10 @@ import numpy as np
 import pytest
 
 from aimd.backends.morse import MorseBackend
-from aimd.checkpoint import load_checkpoint, save_checkpoint
+from aimd.checkpoint import Checkpoint, load_checkpoint, save_checkpoint
 from aimd.integrators import CSVR, LangevinBAOAB, NoseHooverChain, VelocityVerlet
 from aimd.md import run_md
+from aimd.system import MolecularSystem
 from aimd.thermostats import CSVRThermostat
 
 T = 300.0
@@ -84,7 +85,7 @@ def test_restart_reproduces_uninterrupted_run(kind, h4, tmp_path):
     assert (sys2.com_removed, sys2.rotation_removed) == (ref_sys.com_removed, ref_sys.rotation_removed)
 
 
-@pytest.mark.parametrize("kind", ["langevin", "csvr", "nhc"])
+@pytest.mark.parametrize("kind", ["berendsen", "langevin", "csvr", "nhc", "vv+csvr"])
 def test_checkpoint_rebuilds_integrator_with_same_settings(kind, h4, tmp_path):
     s = _start(h4)
     integ = FACTORIES[kind](MorseBackend(s.symbols), 5)
@@ -127,6 +128,22 @@ def test_restart_appends_identical_files_after_simulated_crash(h4, tmp_path):
            trajectory=traj, energy_log=log, restart=ckpt, **kw)
     assert traj.read_bytes() == (tmp_path / "ref.xyz").read_bytes()
     assert log.read_bytes() == (tmp_path / "ref.csv").read_bytes()
+
+
+def test_checkpoint_object_can_be_restarted_from_twice(h4, tmp_path):
+    """
+    Regression: run_md(ckpt.system, ..., restart=ckpt) propagates ckpt.system
+    in place, and a second restart from the same object used to put back
+    those advanced positions together with the saved (old) forces.
+    """
+    s = _start(h4)
+    run_md(s, FACTORIES["csvr"](MorseBackend(s.symbols), 4), 20,
+           checkpoint_path=tmp_path / "c.ckpt")
+    ckpt = load_checkpoint(tmp_path / "c.ckpt")
+    runs = [run_md(ckpt.system, ckpt.make_integrator(MorseBackend(s.symbols)), 15,
+                   restart=ckpt) for _ in range(2)]
+    for key in runs[0].records[0]:
+        assert np.array_equal(runs[0].column(key), runs[1].column(key)), key
 
 
 def test_checkpoint_every_writes_at_multiples_and_at_the_end(h4, tmp_path):
@@ -228,8 +245,8 @@ def test_mismatched_restarts_are_rejected(h4, tmp_path):
     state = nhc.state_dict()
     with pytest.raises(ValueError, match="chain"):
         NoseHooverChain(MorseBackend(s.symbols), 0.2, T, chain_length=4).load_state_dict(state)
-    water = load_checkpoint(tmp_path / "m.ckpt")
-    water.system.symbols = ["O", "H", "H"]
+    water = Checkpoint(MolecularSystem(["O", "H", "H"], np.eye(3)), ck.step, ck.time_fs,
+                       ck.integrator_state)
     with pytest.raises(ValueError, match="atoms"):
         run_md(s, CSVR(MorseBackend(s.symbols), 0.2, T), 1, restart=water)
     with pytest.raises(ValueError, match="either"):
@@ -256,11 +273,16 @@ def test_appending_to_a_log_with_other_columns_is_refused(h4, tmp_path):
     log = tmp_path / "old.csv"
     log.write_text("step,time_fs,potential_Eh,kinetic_Eh,total_Eh,temperature_K\n0,0,0,0,0,0\n")
     s = _start(h4)
+    traj = tmp_path / "t.xyz"
+    run_md(s.copy(), VelocityVerlet(MorseBackend(s.symbols), 0.2), 15, trajectory=traj)
+    frames = traj.read_bytes()
     with warnings.catch_warnings():
         warnings.simplefilter("error")
         with pytest.raises(ValueError, match="cannot append"):
             run_md(s, VelocityVerlet(MorseBackend(s.symbols), 0.2), 1,
-                   energy_log=log, start_step=10)
+                   trajectory=traj, energy_log=log, start_step=10)
+    # Regression: the refused run must not have cut frames 11..15 already.
+    assert traj.read_bytes() == frames
 
 
 def test_partially_written_frame_and_row_are_dropped_on_resume(h4, tmp_path):
