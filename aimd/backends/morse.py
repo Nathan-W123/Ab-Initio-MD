@@ -24,6 +24,7 @@ from aimd.backends.registry import register_backend
 @register_backend
 class MorseBackend(ForceBackend):
     name = "morse"
+    description = "pairwise Morse model surface (not ab initio; tests, plumbing)"
 
     def __init__(
         self,

@@ -4,7 +4,8 @@ bohr / au_time, e * bohr, m_e, hartree), returning arrays or small dataclasses.
 
   rdf         radial_distribution -> RDFResult (g(r), coordination numbers;
               isolated-cluster or periodic cubic-box normalisation)
-  geometry    bond_lengths, bond_angles, dihedral_angles (time series)
+  geometry    bond_lengths, bond_angles, dihedral_angles (time series);
+              circular_mean, unwrap_about for periodic (dihedral) series
   spectra     autocorrelation, velocity_autocorrelation -> VACF,
               vibrational_dos / ir_spectrum -> Spectrum (cm^-1),
               frequency-unit conversions, quantum correction factors
@@ -27,7 +28,13 @@ With the files written by run_md (readers in aimd.trajectory)::
     stats = analysis.column_statistics(read_energy_log("energies.csv"), skip=1000)
 """
 
-from aimd.analysis.geometry import bond_angles, bond_lengths, dihedral_angles
+from aimd.analysis.geometry import (
+    bond_angles,
+    bond_lengths,
+    circular_mean,
+    dihedral_angles,
+    unwrap_about,
+)
 from aimd.analysis.rdf import RDFResult, radial_distribution
 from aimd.analysis.spectra import (
     QUANTUM_CORRECTIONS,
@@ -58,6 +65,7 @@ __all__ = [
     "block_average",
     "bond_angles",
     "bond_lengths",
+    "circular_mean",
     "column_statistics",
     "correlation_spectrum",
     "dihedral_angles",
@@ -65,6 +73,7 @@ __all__ = [
     "lag_window",
     "quantum_correction_factor",
     "radial_distribution",
+    "unwrap_about",
     "velocity_autocorrelation",
     "vibrational_dos",
     "wavenumber_to_angular_frequency",

@@ -23,6 +23,7 @@ from scipy import stats
 from scipy.integrate import solve_ivp
 
 from aimd.backends import get_backend
+from aimd.backends.base import ForceBackend, GradientResult
 from aimd.backends.harmonic import HarmonicBackend
 from aimd.integrators import CSVR, LangevinBAOAB, NoseHooverChain, VelocityVerlet
 from aimd.md import run_md
@@ -375,6 +376,71 @@ def test_global_thermostats_target_reduced_dof_and_keep_constraints(h4):
         p_scale = math.sqrt(s.masses.sum() * 2 * s.kinetic_energy())
         assert np.abs(s.momentum()).max() < 1e-11 * p_scale
         assert np.abs(s.angular_momentum()).max() < 1e-11 * 3.0 * p_scale
+
+
+class _BendableCO2(ForceBackend):
+    """
+    Rotation- and translation-invariant O=C=O model: two harmonic C-O
+    stretches (k, r0) plus a bend kb/2 |u1 + u2|^2 (u = unit C->O vectors)
+    with a linear minimum. Analytic gradient.
+    """
+    name = "bendable_co2"
+    k, r0, kb = 0.8, 2.2, 0.05
+
+    def stretch_energy(self, x: np.ndarray) -> float:
+        r1, r2 = np.linalg.norm(x[0] - x[1]), np.linalg.norm(x[2] - x[1])
+        return 0.5 * self.k * ((r1 - self.r0) ** 2 + (r2 - self.r0) ** 2)
+
+    def compute(self, positions):
+        x = np.asarray(positions, dtype=float).reshape(3, 3)
+        d1, d2 = x[0] - x[1], x[2] - x[1]
+        r1, r2 = np.linalg.norm(d1), np.linalg.norm(d2)
+        u1, u2 = d1 / r1, d2 / r2
+        w = self.kb * (u1 + u2)
+        g = np.zeros((3, 3))
+        g[0] = self.k * (r1 - self.r0) * u1 + (w - u1 * (u1 @ w)) / r1
+        g[2] = self.k * (r2 - self.r0) * u2 + (w - u2 * (u2 @ w)) / r2
+        g[1] = -(g[0] + g[2])
+        e = self.stretch_energy(x) + 0.5 * self.kb * (u1 + u2) @ (u1 + u2)
+        return GradientResult(energy=float(e), gradient=g)
+
+
+def test_linear_triatomic_with_rotation_removed_has_3n_minus_6_dof():
+    """
+    Regression: a linear polyatomic with L = 0 used to get N_dof = 3N - 5 = 4,
+    but Verlet keeps all three components of L (and P) at zero and the
+    molecule bends at once, leaving 3 accessible velocity directions. NHC then
+    drove <K> to 2 kT instead of 3/2 kT (internal modes ~4/3 too hot), and
+    round-off P and L grew to thermal size (max |P|, |L| = 35 within 60k
+    steps). With N_dof = 3: <K> = 3/2 kT, P and L stay at round-off, and
+    the two stretches hold <U> = kT, the canonical value (an all-3N Langevin
+    run of this model gives 0.99 kT, independent of any DOF count).
+    Tolerance 5 block SEs; measured K 1.488 +- 0.012, U 0.998 +- 0.039.
+    """
+    s = MolecularSystem(["O", "C", "O"], [[-2.2, 0.0, 0.0], [0.0, 0.0, 0.0], [2.2, 0.0, 0.0]])
+    assert s.is_linear()
+    s.initialize_velocities(T, rng=11, remove_rotation=True)
+    assert s.n_dof == 3
+    backend = _BendableCO2(s.symbols)
+    u, drift = [], []
+    scale = math.sqrt(s.masses.sum() * KT)            # thermal momentum scale
+    n_steps = 30000
+    res = run_md(s, NoseHooverChain(backend, 0.5, T, period_fs=20.0), n_steps,
+                 callback=lambda _r: (u.append(backend.stretch_energy(s.positions) / KT),
+                                      drift.append(max(np.abs(s.momentum()).max(),
+                                                       np.abs(s.angular_momentum()).max()))))
+    assert not s.is_linear()
+    # P and L are conserved by Verlet and only multiplied by the thermostat's
+    # global scale factor, so their round-off seeds (~1e-15) random-walk in
+    # log; measured max 7e-6 here (scale 8.7), against 35 with N_dof = 4
+    assert max(drift) < 1e-4 * scale
+    burn = n_steps // 10
+    kin = res.column("kinetic_Eh")[burn:] / KT
+    u = np.array(u)[burn:]
+    for (mean, se), expect, cap in [((kin.mean(), block_se(kin)), 1.5, 0.02),
+                                    ((u.mean(), block_se(u)), 1.0, 0.06)]:
+        assert se < cap, (mean, se)
+        assert abs(mean - expect) < 5 * se, (mean, se)
 
 
 # ── Conserved quantities on an anharmonic surface ─────────────────────────────

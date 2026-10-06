@@ -150,6 +150,20 @@ def lag_window(name: str, max_lag: int) -> np.ndarray:
     return w / w[0]                                   # exactly 1 at lag 0
 
 
+def _check_dt(dt_fs: float) -> float:
+    dt = float(dt_fs)
+    if not (math.isfinite(dt) and dt > 0.0):
+        raise ValueError(f"dt_fs must be a positive frame spacing, got {dt_fs!r}")
+    return dt
+
+
+def _check_temperature(temperature_k: float | None) -> float:
+    t = math.nan if temperature_k is None else float(temperature_k)
+    if not (math.isfinite(t) and t > 0.0):
+        raise ValueError(f"temperature_k must be positive and finite, got {temperature_k!r}")
+    return t
+
+
 def _default_lag(n: int, max_lag: int | None) -> int:
     m = n // 2 if max_lag is None else int(max_lag)
     if not 1 <= m < n:
@@ -215,6 +229,8 @@ def _velocity_series(
     v = np.asarray(velocities, dtype=float)
     if v.ndim != 3 or v.shape[2] != 3:
         raise ValueError("velocities must have shape (n_frames, N, 3)")
+    if not np.all(np.isfinite(v)):
+        raise ValueError("velocities contain nan/inf")
     idx = np.arange(v.shape[1]) if atoms is None else np.asarray(atoms, dtype=int).reshape(-1)
     w = None
     if masses is not None:
@@ -237,9 +253,10 @@ def velocity_autocorrelation(
     apart. With ``masses`` (N,) it is mass-weighted; ``atoms`` selects a
     subset of atoms (partial VACF). Lags 0..max_lag (default n - 1).
     """
+    dt_fs = _check_dt(dt_fs)
     v, w = _velocity_series(velocities, masses, atoms)
     acf = autocorrelation(v, max_lag, weights=w)
-    return VACF(time_fs=np.arange(acf.size) * float(dt_fs), acf=acf,
+    return VACF(time_fs=np.arange(acf.size) * dt_fs, acf=acf,
                 mass_weighted=masses is not None)
 
 
@@ -287,6 +304,7 @@ def correlation_spectrum(
     lags 0..M (``acf``), spaced ``dt_fs``: windowed cosine transform with
     integral over nu~ equal to acf[0] (see the module docstring).
     """
+    dt_fs = _check_dt(dt_fs)
     c = np.asarray(acf, dtype=float).reshape(-1)
     m = c.size - 1
     if m < 1:
@@ -301,7 +319,7 @@ def correlation_spectrum(
     seq[: m + 1] = cw
     seq[length - m :] = cw[:0:-1]
     cosine_sum = np.fft.rfft(seq).real               # w0 C0 + 2 sum_k wk Ck cos(.)
-    dt_au = float(dt_fs) * FS_TO_AU_TIME
+    dt_au = dt_fs * FS_TO_AU_TIME
     nu = np.arange(length // 2 + 1) / (length * dt_au * C_CM_PER_AU_TIME)
     return Spectrum(
         wavenumber=nu,
@@ -343,15 +361,21 @@ def quantum_correction_factor(
     """
     Factor R(x), x = hbar omega / kT, that multiplies the classical IR line
     shape for quantum correction ``kind`` (module docstring); R -> 1 as x -> 0.
+
+    The Schofield factor grows as e^(x/2) / x: at 300 K it is ~1.5e3 at
+    4000 cm^-1 and ~1e32 at the Nyquist wavenumber of 0.5 fs frames, so any
+    noise or window leakage far above the physical bands (dipole noise of
+    1e-9 e bohr already gives an intensity ~1e25 times the peak at Nyquist)
+    dominates the corrected spectrum there. Restrict ``peak`` / ``band_area``
+    to the physical range when using it.
     """
     if kind in (None, "harmonic", "classical"):
         return np.ones_like(np.asarray(wavenumber, dtype=float))
     if kind not in QUANTUM_CORRECTIONS:
         raise ValueError(f"unknown quantum correction {kind!r}; use one of {QUANTUM_CORRECTIONS}")
-    if temperature_k <= 0.0:
-        raise ValueError("temperature_k must be positive")
+    temperature_k = _check_temperature(temperature_k)
     omega = wavenumber_to_angular_frequency(np.asarray(wavenumber, dtype=float))
-    # Capped so that sinh stays finite; such frequencies carry no intensity.
+    # Capped only so that sinh stays finite (R <= ~1e301).
     x = np.minimum(omega / (KB_AU * temperature_k), 1400.0)
     small = x < 1e-8
     xs = np.where(small, 1.0, x)
@@ -385,7 +409,13 @@ def ir_spectrum(
     only the classical / harmonic correction is then possible. With it, the
     intensity is the molar absorption cross-section in km mol^-1 per cm^-1
     (band areas in km/mol) with ``quantum_correction`` applied.
+
+    The dipoles of run_md are taken about the origin, so for a charged
+    system mu' contains Q v_com: remove the centre-of-mass motion first (as
+    MolecularSystem.initialize_velocities does) or the translation shows up
+    as a band at nu~ = 0.
     """
+    dt_fs = _check_dt(dt_fs)
     mu = np.asarray(dipoles, dtype=float)
     mu = mu.reshape(mu.shape[0], -1)
     if not np.all(np.isfinite(mu)):
@@ -397,7 +427,9 @@ def ir_spectrum(
                          f"use one of {QUANTUM_CORRECTIONS}")
     if temperature_k is None and quantum_correction not in (None, "harmonic", "classical"):
         raise ValueError(f"the {quantum_correction!r} correction needs temperature_k")
-    dt_au = float(dt_fs) * FS_TO_AU_TIME
+    if temperature_k is not None:
+        temperature_k = _check_temperature(temperature_k)
+    dt_au = dt_fs * FS_TO_AU_TIME
     mu_dot = np.diff(mu, axis=0) / dt_au
     m = _default_lag(mu_dot.shape[0], max_lag)
     spec = correlation_spectrum(autocorrelation(mu_dot, m), dt_fs, window, zero_pad)
@@ -409,8 +441,6 @@ def ir_spectrum(
         spec.intensity = intensity
         spec.unit = "(e bohr / au_time)^2 per cm^-1"
         return spec
-    if temperature_k <= 0.0:
-        raise ValueError("temperature_k must be positive")
     beta = 1.0 / (KB_AU * temperature_k)
     prefactor = math.pi * beta / (3.0 * C_AU**2) * AVOGADRO * BOHR_TO_KM
     spec.intensity = prefactor * quantum_correction_factor(

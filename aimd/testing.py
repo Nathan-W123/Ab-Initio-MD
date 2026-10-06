@@ -1,9 +1,9 @@
 """
 Validation helpers for backends.
 
-``finite_difference_gradient`` is the yardstick for any new analytic gradient
-(e.g. the RHF gradient to be ported from HF-SCF-Engine): it should agree with
-the analytic result to ~1e-6 Eh/bohr for a well-converged SCF.
+``finite_difference_gradient`` is the yardstick for any new analytic gradient:
+for a well-converged SCF it should agree with the analytic result to ~1e-6
+Eh/bohr or better (the native hf backend agrees to ~1e-9 with step 1e-4).
 """
 
 from __future__ import annotations

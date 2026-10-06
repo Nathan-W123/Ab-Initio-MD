@@ -205,3 +205,11 @@ def test_invalid_integrator_and_driver_arguments(h4):
         VelocityVerlet(b, 0.2, temperature_k=300.0)
     with pytest.raises(ValueError, match="checkpoint_path"):
         run_md(h4, VelocityVerlet(b, 0.2), 1, checkpoint_every=5)
+    # Regression: NaN slipped through the "<= 0" / "< 0" checks and turned
+    # every velocity into NaN on the first step.
+    with pytest.raises(ValueError, match="tau_fs"):
+        VelocityVerlet(b, 0.2, temperature_k=300.0, berendsen_tau_fs=float("nan"))
+    with pytest.raises(ValueError, match="temperature_k"):
+        LangevinBAOAB(b, 0.2, float("nan"))
+    with pytest.raises(ValueError, match="friction"):
+        LangevinBAOAB(b, 0.2, 300.0, friction_per_fs=float("nan"))

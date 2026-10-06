@@ -1,0 +1,17 @@
+{
+  "xyz": "methyl_radical.xyz",
+  "backend": "hf",
+  "basis": "6-31g*",
+  "reference": "uhf",
+  "multiplicity": 2,
+  "steps": 400,
+  "dt": 0.5,
+  "thermostat": "nve",
+  "temperature": 300.0,
+  "remove_rotation": true,
+  "seed": 7,
+  "trajectory": "ch3.xyz",
+  "energies": "ch3_energies.csv",
+  "dipoles": "ch3_dipoles.csv",
+  "print_every": 20
+}

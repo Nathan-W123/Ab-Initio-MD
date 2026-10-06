@@ -26,7 +26,7 @@ from aimd.thermostats import CSVRThermostat, NoseHooverChainThermostat
 from aimd.xlbomd import XL_COEFFICIENTS, AuxiliaryDensity, xl_coefficients
 
 ORDERS = sorted(XL_COEFFICIENTS)
-WATER_XYZ = Path(__file__).resolve().parent.parent / "examples" / "water.xyz"
+WATER_XYZ = Path(__file__).resolve().parent / "data" / "water_experimental.xyz"
 
 
 def _recursion(k: int) -> np.ndarray:
@@ -443,7 +443,7 @@ def test_loose_scf_xlbomd_energy_stays_at_the_verlet_level(pyscf_md):
     assert bo.total_energy_drift > 4.0 * tight.total_energy_drift
 
 
-@pytest.mark.parametrize("case", ["rhf", "uhf", "rhf-csvr", "rhf-bomd"])
+@pytest.mark.parametrize("case", ["rhf", "uhf", "rhf-csvr", "rhf-bomd", "rhf-bomd-noreuse"])
 def test_restart_is_exact_with_pyscf(case, tmp_path):
     """
     N steps + checkpoint + restart (fresh backend and integrator) + N steps
@@ -453,6 +453,11 @@ def test_restart_is_exact_with_pyscf(case, tmp_path):
     restart without that guess information changes the positions after N
     more steps by far more (measured 1.2e-5, 1.1e-4, 3.8e-5 bohr for rhf,
     uhf, rhf-bomd).
+
+    Regression ("rhf-bomd-noreuse"): a backend with reuse_density=False starts
+    every SCF from its initial guess, so the restart must not hand it the saved
+    density; it used to, and the restarted run differed by 3.1e-5 bohr. The
+    control there is that old behaviour.
     """
     pytest.importorskip("pyscf")
     from pyscf import lib
@@ -470,10 +475,11 @@ def test_restart_is_exact_with_pyscf(case, tmp_path):
             return s
 
         def backend():
-            return PySCFBackend(["O", "H", "H"], charge, mult, conv_tol=1e-5)
+            return PySCFBackend(["O", "H", "H"], charge, mult, conv_tol=1e-5,
+                                reuse_density=case != "rhf-bomd-noreuse")
 
         def integrator(b):
-            if case == "rhf-bomd":
+            if case.startswith("rhf-bomd"):
                 return VelocityVerlet(b, 0.5)
             thermo = CSVRThermostat(300.0, tau_fs=20.0, rng=8) if "csvr" in case else None
             return XLBOMD(b, 0.5, thermostat=thermo)
@@ -485,7 +491,7 @@ def test_restart_is_exact_with_pyscf(case, tmp_path):
         s = start()
         first = run_md(s, integrator(backend()), n, checkpoint_path=tmp_path / "xl.ckpt")
         ckpt = load_checkpoint(tmp_path / "xl.ckpt")
-        if case != "rhf-bomd":
+        if not case.startswith("rhf-bomd"):
             shape = (6, 2, 7, 7) if case == "uhf" else (6, 7, 7)
             assert ckpt.integrator_state["xl"]["history"].shape == shape
         second = run_md(ckpt.system, ckpt.make_integrator(backend()), n, restart=ckpt)
@@ -498,16 +504,41 @@ def test_restart_is_exact_with_pyscf(case, tmp_path):
         assert np.max(np.abs(ckpt.system.velocities - ref_sys.velocities)) <= 1e-10
 
         # Control: same checkpoint without the guess information (XL: history
-        # replaced by the saved SCF density; BOMD: backend's guess dropped).
+        # replaced by the saved SCF density; BOMD: backend's guess dropped;
+        # no-reuse BOMD: the saved density handed over as the old code did).
         b3 = backend()
         integ3 = ckpt.make_integrator(b3)
         sys3 = start()
         ckpt.restore(sys3, integ3)
         if case == "rhf-bomd":
             b3.reset_guess()
+        elif case == "rhf-bomd-noreuse":
+            b3.set_density_guess(integ3.result.density)
         else:
             integ3.aux.reset(integ3.result.density)
         run_md(sys3, integ3, n, start_step=n)
         assert np.max(np.abs(sys3.positions - ref_sys.positions)) > 1e-8
     finally:
         lib.num_threads(old)
+
+
+def test_restricted_history_is_rejected_by_an_unrestricted_non_reusing_backend():
+    """
+    Regression: with reuse_density=False the restart no longer hands the saved
+    density to the backend (which validated its shape), so XL-BOMD checks its
+    history against the backend's ``density_shape`` itself. Before, a
+    restricted checkpoint loaded into an unrestricted run and failed only in
+    the next step, after the system had been moved.
+    """
+    pytest.importorskip("pyscf")
+    from aimd.backends.pyscf_backend import PySCFBackend
+
+    s = MolecularSystem.from_xyz(WATER_XYZ)
+    s.initialize_velocities(300.0, rng=1)
+    xl = XLBOMD(PySCFBackend(s.symbols, conv_tol=1e-6), 0.5)
+    run_md(s, xl, 1)
+    state = xl.state_dict()
+    other = XLBOMD(PySCFBackend(s.symbols, reference="uhf", reuse_density=False), 0.5)
+    with pytest.raises(ValueError, match="backend's"):
+        other.load_state_dict(state)
+    assert other.result is None and not other.aux.initialized

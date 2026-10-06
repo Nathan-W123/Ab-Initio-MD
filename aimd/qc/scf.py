@@ -269,7 +269,10 @@ def electron_counts(nuclear_charge: int, charge: int, multiplicity: int,
     if mult - 1 > n:
         raise ValueError(f"multiplicity {mult} needs at least {mult - 1} electrons, have {n}")
     na, nb = (n + mult - 1) // 2, (n - mult + 1) // 2
-    if _REFERENCES.get(reference, reference) == "rhf" and na != nb:
+    ref = str(reference).strip().lower()
+    if ref not in _REFERENCES:
+        raise ValueError(f"unknown reference {reference!r}; use 'rhf' or 'uhf'")
+    if _REFERENCES[ref] == "rhf" and na != nb:
         raise ValueError(
             f"RHF needs a closed-shell singlet; {n} electrons with multiplicity "
             f"{mult} is open-shell (use UHF)")
@@ -655,6 +658,32 @@ class SCFResult:
 
 # ================================================================= solver
 
+# Closest allowed approach of two nuclei, bohr (PySCF's "Ill geometry" test
+# in gto.mole.energy_nuc uses the same 1e-5 bohr).
+MIN_NUCLEAR_SEPARATION = 1e-5
+
+
+def check_nuclear_separation(positions: np.ndarray, atomic_numbers: np.ndarray) -> None:
+    """
+    ValueError if two nuclei (Z > 0) are closer than MIN_NUCLEAR_SEPARATION
+    bohr. Coincident nuclei make Z_A Z_B / R_AB and its gradient infinite /
+    NaN while the electronic integrals stay finite, so an SCF would "converge"
+    to E = +inf; refuse instead, like non-finite positions (aimd.qc.basis).
+    """
+    x = np.asarray(positions, dtype=float).reshape(-1, 3)
+    z = np.asarray(atomic_numbers)
+    if len(x) < 2 or not np.all(np.isfinite(x)):
+        return                       # non-finite positions: refused by BasisSet
+    r = np.linalg.norm(x[:, None, :] - x[None, :, :], axis=-1)
+    i, j = np.triu_indices(len(x), k=1)
+    bad = (r[i, j] < MIN_NUCLEAR_SEPARATION) & (z[i] > 0) & (z[j] > 0)
+    if np.any(bad):
+        k = int(np.argmax(bad))
+        raise ValueError(
+            f"atoms {i[k]} and {j[k]} are {r[i[k], j[k]]:.3g} bohr apart (coincident "
+            f"nuclei, < {MIN_NUCLEAR_SEPARATION:g} bohr): the nuclear repulsion is infinite")
+
+
 class SCFSolver:
     """
     Reusable RHF/UHF solver for one molecule (atoms, basis, charge, spin).
@@ -743,6 +772,7 @@ class SCFSolver:
         x = np.array(positions, dtype=float).reshape(-1, 3)
         if x.shape[0] != self.basis.natm:
             raise ValueError(f"expected {self.basis.natm} positions, got {x.shape[0]}")
+        check_nuclear_separation(x, self.basis.atomic_numbers)
         if (self._ints is None or self._ints_options is not self.options
                 or not np.array_equal(x, self._ints_positions)):
             self._ints = None      # release the old ERI tensor before building the new one
@@ -803,6 +833,11 @@ class SCFSolver:
         ``options.guess``; "sad" / "core" / "gwh"; a density array; or an
         SCFResult). Unconverged runs are returned flagged, see module docstring.
         """
+        return self._run(positions, guess, stacklevel=3)
+
+    def _run(self, positions: np.ndarray, guess: Any, stacklevel: int) -> SCFResult:
+        # stacklevel: frames from warnings.warn up to the public caller, so the
+        # SCFConvergenceWarning points at the user's call (run or run_scf)
         t0 = time.perf_counter()
         with limit_blas_threads(self.options.blas_threads):
             I = self.integrals(positions)
@@ -822,7 +857,7 @@ class SCFSolver:
                 f"SCF not converged after {res.iterations} iterations "
                 f"(dE = {res.energy_change:.2e} Eh, commutator {res.commutator_norm:.2e}); "
                 "returning the last iterate flagged converged=False",
-                SCFConvergenceWarning, stacklevel=2)
+                SCFConvergenceWarning, stacklevel=stacklevel)
         return res
 
     def _fock(self, I: SCFIntegrals, Ds: np.ndarray) -> np.ndarray:
@@ -944,4 +979,4 @@ def run_scf(
     """One-shot SCF: ``SCFSolver(...).run(positions, guess)``."""
     solver = SCFSolver(symbols, basis, charge=charge, multiplicity=multiplicity,
                        reference=reference, options=options, **overrides)
-    return solver.run(positions, guess=guess)
+    return solver._run(positions, guess, stacklevel=3)

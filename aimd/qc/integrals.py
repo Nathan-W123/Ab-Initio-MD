@@ -27,9 +27,13 @@ Integrals
 
 ERI tensor size limit: the full tensor takes 8 nao^4 bytes (nao = 100: 0.8
 GB, nao = 150: 4 GB), so ``eri_tensor`` refuses nao > 120 (~1.6 GB) unless
-``max_nao`` is raised. Only shell quartets unique under the 8-fold
-permutational symmetry are computed, and quartets with Q_ab Q_cd below
-``schwarz_threshold`` (Q_ab = max |(ab|ab)|^(1/2) over the shell pair; Haser &
+``max_nao`` is raised. The two-electron kernels loop over the basis's
+contraction blocks (:mod:`aimd.qc.basis`: the shells of a general
+contraction share their primitives), evaluating each primitive quartet once
+and contracting it into every combination of the blocks' contractions, as
+libcint does for general contractions. Only block quartets unique under the
+8-fold permutational symmetry are computed, and quartets with Q_ab Q_cd below
+``schwarz_threshold`` (Q_ab = max |(ab|ab)|^(1/2) over the block pair; Haser &
 Ahlrichs, J. Comput. Chem. 10, 104 (1989)) are skipped; the Schwarz
 inequality makes this a strict bound, |dropped (mn|ls)| < threshold.
 Primitive pairs with mu |A - B|^2 > PRIM_CUTOFF (exp(-mu R^2) < 2e-22) are
@@ -38,7 +42,7 @@ dropped as well. The gradient contraction never stores any 4-index array.
 Parallelism: the quartet loops (Schwarz bounds, ERI tensor, ERI gradient,
 J/K) run on numba threads (``NUMBA_NUM_THREADS`` / ``numba.set_num_threads``)
 over a fixed number of work chunks, so results are bitwise identical for any
-thread count. Shell-pair data and Schwarz bounds are cached on the BasisSet
+thread count. Block-pair data and Schwarz bounds are cached on the BasisSet
 (i.e. per geometry) and shared by eri_tensor and two_electron_gradient.
 
 Compiled-code cache: numba's on-disk cache (``cache=True``) is keyed on the
@@ -293,15 +297,15 @@ def _nuclear_kernel(shell_atom, shell_l, shell_prim, shell_ao, prim_exp, prim_co
                         if d == 0:
                             e00 *= prim_coef[ka] * prim_coef[kb]
                         hermite_e(li, lj, a, b, xab, e00, E[d])
-                    px = (a * positions[ai, 0] + b * positions[aj, 0]) / p
-                    py = (a * positions[ai, 1] + b * positions[aj, 1]) / p
-                    pz = (a * positions[ai, 2] + b * positions[aj, 2]) / p
+                    # P - C = (A - C) - (b/p)(A - B): exact zero when A = B = C,
+                    # and no loss of digits to large absolute coordinates
+                    bp = b / p
                     for h in range(nh):
                         Rsum[h] = 0.0
                     for c in range(nc):
-                        X = px - charge_pos[c, 0]
-                        Y = py - charge_pos[c, 1]
-                        Z = pz - charge_pos[c, 2]
+                        X = (positions[ai, 0] - charge_pos[c, 0]) - bp * (positions[ai, 0] - positions[aj, 0])
+                        Y = (positions[ai, 1] - charge_pos[c, 1]) - bp * (positions[ai, 1] - positions[aj, 1])
+                        Z = (positions[ai, 2] - charge_pos[c, 2]) - bp * (positions[ai, 2] - positions[aj, 2])
                         hermite_r(L, p, X, Y, Z, R, Rt)
                         w = -charges[c] * 2.0 * _PI / p
                         for h in range(nh):
@@ -466,13 +470,11 @@ def _nuclear_grad_kernel(shell_atom, shell_l, shell_prim, shell_ao, prim_exp, pr
                             for h in range(nh1):
                                 for d in range(3):
                                     dA[d, h] += w * _dherm3_a(E, ix, iy, iz, jx, jy, jz, h, d, a)
-                    px = (a * positions[ai, 0] + b * positions[aj, 0]) / p
-                    py = (a * positions[ai, 1] + b * positions[aj, 1]) / p
-                    pz = (a * positions[ai, 2] + b * positions[aj, 2]) / p
+                    bp = b / p      # P - C as in _nuclear_kernel
                     for c in range(natm):
-                        X = px - positions[c, 0]
-                        Y = py - positions[c, 1]
-                        Z = pz - positions[c, 2]
+                        X = (positions[ai, 0] - positions[c, 0]) - bp * (positions[ai, 0] - positions[aj, 0])
+                        Y = (positions[ai, 1] - positions[c, 1]) - bp * (positions[ai, 1] - positions[aj, 1])
+                        Z = (positions[ai, 2] - positions[c, 2]) - bp * (positions[ai, 2] - positions[aj, 2])
                         hermite_r(L + 1, p, X, Y, Z, R, Rt)
                         pref = -charges[c] * 2.0 * _PI / p
                         for d in range(3):
@@ -499,7 +501,7 @@ def _nuclear_grad_kernel(shell_atom, shell_l, shell_prim, shell_ao, prim_exp, pr
                             grad[aj, d] -= gA + gC
 
 
-# ============================================================ shell pairs
+# ============================================================ block pairs
 
 # Primitive pairs with mu |A - B|^2 > PRIM_CUTOFF are dropped from the ERI
 # pair lists: their Gaussian-product prefactor exp(-mu R^2) < 2e-22 is far
@@ -521,34 +523,38 @@ CHUNK_FIRST = np.array([int(f"{c:06b}"[::-1], 2) for c in range(NCHUNK)], dtype=
 
 
 @njit(cache=True)
-def _build_pairs(shell_atom, shell_l, shell_prim, prim_exp, prim_coef, positions):
+def _build_pairs(blk_atom, blk_l, blk_prim, blk_exp, blk_coef, blk_ncon, positions):
     """
-    Primitive-pair data for every shell pair (i >= j), pair index i(i+1)/2 + j.
-    E[k, d, i, j, t] holds Hermite coefficients up to i <= l_i + 1,
-    j <= l_j + 1 (enough for first derivatives on either center), with the
-    contraction coefficients folded into the x factor.
+    Primitive-pair data for every pair of contraction blocks (i >= j), pair
+    index i(i+1)/2 + j (blocks: see aimd.qc.basis). E[k, d, i, j, t] holds
+    the Hermite coefficients (without contraction coefficients) up to
+    i <= l_i + 1, j <= l_j + 1 (enough for first derivatives on either
+    center); C[k, ci * ncon_j + cj] = c_i[ka, ci] c_j[kb, cj] are the
+    contraction-coefficient products of primitive pair k = (ka, kb).
     """
-    ns = shell_l.shape[0]
-    npair = ns * (ns + 1) // 2
+    nb = blk_l.shape[0]
+    npair = nb * (nb + 1) // 2
     lmax = 0
-    for s in range(ns):
-        lmax = max(lmax, shell_l[s])
+    maxcon = 1
+    for s in range(nb):
+        lmax = max(lmax, blk_l[s])
+        maxcon = max(maxcon, blk_ncon[s])
     pair_pp = np.zeros(npair + 1, dtype=np.int64)
-    pair_shells = np.zeros((npair, 2), dtype=np.int64)
+    pair_blocks = np.zeros((npair, 2), dtype=np.int64)
     npp = 0
     ip = 0
-    for i in range(ns):
+    for i in range(nb):
         for j in range(i + 1):
             pair_pp[ip] = npp
-            pair_shells[ip, 0] = i
-            pair_shells[ip, 1] = j
+            pair_blocks[ip, 0] = i
+            pair_blocks[ip, 1] = j
             r2 = 0.0
             for d in range(3):
-                r2 += (positions[shell_atom[i], d] - positions[shell_atom[j], d]) ** 2
-            for ka in range(shell_prim[i], shell_prim[i + 1]):
-                for kb in range(shell_prim[j], shell_prim[j + 1]):
-                    a = prim_exp[ka]
-                    b = prim_exp[kb]
+                r2 += (positions[blk_atom[i], d] - positions[blk_atom[j], d]) ** 2
+            for ka in range(blk_prim[i], blk_prim[i + 1]):
+                for kb in range(blk_prim[j], blk_prim[j + 1]):
+                    a = blk_exp[ka]
+                    b = blk_exp[kb]
                     if a * b / (a + b) * r2 <= PRIM_CUTOFF:
                         npp += 1
             ip += 1
@@ -556,18 +562,20 @@ def _build_pairs(shell_atom, shell_l, shell_prim, prim_exp, prim_coef, positions
     pp_ab = np.zeros((npp, 2))
     pp_P = np.zeros((npp, 3))
     pp_E = np.zeros((npp, 3, lmax + 2, lmax + 2, 2 * lmax + 4))
+    pp_C = np.zeros((npp, maxcon * maxcon))
     k = 0
-    for i in range(ns):
-        ai = shell_atom[i]
+    for i in range(nb):
+        ai = blk_atom[i]
         for j in range(i + 1):
-            aj = shell_atom[j]
+            aj = blk_atom[j]
+            ncj = blk_ncon[j]
             r2 = 0.0
             for d in range(3):
                 r2 += (positions[ai, d] - positions[aj, d]) ** 2
-            for ka in range(shell_prim[i], shell_prim[i + 1]):
-                a = prim_exp[ka]
-                for kb in range(shell_prim[j], shell_prim[j + 1]):
-                    b = prim_exp[kb]
+            for ka in range(blk_prim[i], blk_prim[i + 1]):
+                a = blk_exp[ka]
+                for kb in range(blk_prim[j], blk_prim[j + 1]):
+                    b = blk_exp[kb]
                     p = a + b
                     mu = a * b / p
                     # exact negation of the counting test above: with a NaN
@@ -578,26 +586,38 @@ def _build_pairs(shell_atom, shell_l, shell_prim, prim_exp, prim_coef, positions
                         continue
                     pp_ab[k, 0] = a
                     pp_ab[k, 1] = b
+                    for ci in range(blk_ncon[i]):
+                        for cj in range(ncj):
+                            pp_C[k, ci * ncj + cj] = blk_coef[ka, ci] * blk_coef[kb, cj]
                     for d in range(3):
                         xab = positions[ai, d] - positions[aj, d]
-                        pp_P[k, d] = (a * positions[ai, d] + b * positions[aj, d]) / p
+                        # = (a A + b B)/p, written so that P = A exactly when A = B
+                        pp_P[k, d] = positions[ai, d] - (b / p) * xab
                         e00 = math.exp(-mu * xab * xab)
-                        if d == 0:
-                            e00 *= prim_coef[ka] * prim_coef[kb]
-                        hermite_e(shell_l[i] + 1, shell_l[j] + 1, a, b, xab, e00, pp_E[k, d])
+                        hermite_e(blk_l[i] + 1, blk_l[j] + 1, a, b, xab, e00, pp_E[k, d])
                     k += 1
-    return pair_pp, pair_shells, pp_ab, pp_P, pp_E
+    return pair_pp, pair_blocks, pp_ab, pp_P, pp_E, pp_C
 
 
 class _Pairs:
-    """Geometry-dependent shell-pair data (cached on the BasisSet)."""
+    """Geometry-dependent block-pair data and scratch sizes (cached on the BasisSet)."""
 
     def __init__(self, basis: BasisSet) -> None:
-        (self.pair_pp, self.pair_shells, self.pp_ab, self.pp_P,
-         self.pp_E) = _build_pairs(basis.shell_atom, basis.shell_l, basis.shell_prim,
-                                   basis.prim_exp, basis.prim_coef, basis.positions)
-        self.npair = self.pair_shells.shape[0]
-        self.maxpp = max(int(np.max(np.diff(self.pair_pp))), 1) if self.npair else 1
+        (self.pair_pp, self.pair_blocks, self.pp_ab, self.pp_P, self.pp_E,
+         self.pp_C) = _build_pairs(basis.blk_atom, basis.blk_l, basis.blk_prim, basis.blk_exp,
+                                   basis.blk_coef, basis.blk_ncon, basis.positions)
+        self.npair = self.pair_blocks.shape[0]
+        npp = np.diff(self.pair_pp)
+        self.maxpp = max(int(npp.max()), 1) if self.npair else 1
+        # largest row count (contractions x Cartesian components) of a pair,
+        # and of npp * (number of Hermite functions) for the gradient's Gk
+        i, j = self.pair_blocks.T
+        l, ncon = basis.blk_l, basis.blk_ncon
+        nc = (l + 1) * (l + 2) // 2
+        rows = ncon[i] * ncon[j] * nc[i] * nc[j]
+        nh = np.array([NHERM[v] for v in (l[i] + l[j])], dtype=np.int64)
+        self.maxrow = max(int(rows.max()), 1) if self.npair else 1
+        self.maxpph = max(int((npp * nh).max()), 1) if self.npair else 1
 
 
 def _pairs(basis: BasisSet) -> _Pairs:
@@ -608,14 +628,28 @@ def _pairs(basis: BasisSet) -> _Pairs:
 
 
 # ============================================================ ERIs
+#
+# Block quartet (IJ|KL) in the bra pair pb = (I, J) and ket pair pk = (K, L):
+# rows r = (ci ncon_J + cj) nab + ab, columns (ck ncon_L + cl) ncd + cd, with
+# ab = ia ncart_J + ib and cd likewise. The primitive integrals are
+#
+#   (ab|cd)_prim = 2 pi^(5/2) / (p q sqrt(p + q))
+#                  sum_{tuv} E^{ab}_{tuv} sum_{t'u'v'} (-1)^{t'+u'+v'} E^{cd}_{t'u'v'}
+#                  R_{t+t', u+u', v+v'}(alpha, P - Q)
+#
+# and the contracted ones sum_{bp, kp} C_bp[cij] C_kp[ckl] (ab|cd)_prim.
+# Per primitive quartet the Boys function and R_tuv are evaluated once and
+# contracted into every (cij, ckl) combination: ket coefficients enter X,
+# bra coefficients the final accumulation (folded into scalars when a pair
+# has a single contraction, the segmented case).
 
 @njit(cache=True)
-def _ket_hermite(pk, pair_pp, pair_shells, shell_l, pp_E, Ek):
+def _ket_hermite(pk, pair_pp, pair_blocks, blk_l, pp_E, Ek):
     """Ek[kp, k, cd] = (-1)^{|k|} E^{cd}_k (component factors included) for ket pair pk."""
-    sk = pair_shells[pk, 0]
-    sl = pair_shells[pk, 1]
-    lk = shell_l[sk]
-    ll = shell_l[sl]
+    sk = pair_blocks[pk, 0]
+    sl = pair_blocks[pk, 1]
+    lk = blk_l[sk]
+    ll = blk_l[sl]
     c0 = CART_OFF[lk]
     nck = CART_OFF[lk + 1] - c0
     d0 = CART_OFF[ll]
@@ -657,89 +691,137 @@ def _hidx_fill(nh, nhk, hidx):
                                   HERM_TUV[h, 2] + HERM_TUV[k, 2]]
 
 
-@njit(cache=True)
-def _eri_block(pb, pk, pair_pp, pair_shells, shell_l, pp_ab, pp_P, pp_E,
-               block, Ek, X, RR, hidx):
-    """block[ab, cd] = (ab|cd) for bra shell pair pb and ket shell pair pk."""
-    si = pair_shells[pb, 0]
-    sj = pair_shells[pb, 1]
-    sk = pair_shells[pk, 0]
-    sl = pair_shells[pk, 1]
-    li = shell_l[si]
-    lj = shell_l[sj]
-    lk = shell_l[sk]
-    ll = shell_l[sl]
-    a0 = CART_OFF[li]
-    nci = CART_OFF[li + 1] - a0
-    b0 = CART_OFF[lj]
-    ncj = CART_OFF[lj + 1] - b0
-    ncd = (CART_OFF[lk + 1] - CART_OFF[lk]) * (CART_OFF[ll + 1] - CART_OFF[ll])
-    Lab = li + lj
-    L = Lab + lk + ll
-    nhb = NHERM[Lab]
-    nhk = NHERM[lk + ll]
-    _hidx_fill(nhb, nhk, hidx)
-    _ket_hermite(pk, pair_pp, pair_shells, shell_l, pp_E, Ek)
-    for ab in range(nci * ncj):
-        for cd in range(ncd):
-            block[ab, cd] = 0.0
+@njit(cache=True, inline="always")
+def _pair_dims(ip, pair_blocks, blk_l, blk_ncon):
+    """(Cartesian component pairs, contraction pairs) of block pair ip."""
+    i = pair_blocks[ip, 0]
+    j = pair_blocks[ip, 1]
+    li = blk_l[i]
+    lj = blk_l[j]
+    return ((CART_OFF[li + 1] - CART_OFF[li]) * (CART_OFF[lj + 1] - CART_OFF[lj]),
+            blk_ncon[i] * blk_ncon[j])
+
+
+@njit(cache=True, inline="always")
+def _ket_r_contract(bp, pk, nh, L, pair_pp, pp_ab, pp_P, pp_C, Ek, nhk, ncd, nkc, X, T, RR, hidx):
+    """
+    X[h, ckl ncd + cd] = sum_kp C_kp[ckl] sum_k pref R_{h+k}(alpha, P - Q) Ek[kp, k, cd]
+    for bra primitive pair bp, h < nh (R up to order L), over the ket pair pk.
+    """
+    p = pp_ab[bp, 0] + pp_ab[bp, 1]
+    for h in range(nh):
+        for col in range(nkc * ncd):
+            X[h, col] = 0.0
     k0 = pair_pp[pk]
-    nkp = pair_pp[pk + 1] - k0
-    for bp in range(pair_pp[pb], pair_pp[pb + 1]):
-        p = pp_ab[bp, 0] + pp_ab[bp, 1]
-        for h in range(nhb):
-            for cd in range(ncd):
-                X[h, cd] = 0.0
-        for kp in range(nkp):
-            q = pp_ab[k0 + kp, 0] + pp_ab[k0 + kp, 1]
-            alpha = p * q / (p + q)
-            pref = _TWO_PI_2_5 / (p * q * math.sqrt(p + q))
-            x = pp_P[bp, 0] - pp_P[k0 + kp, 0]
-            y = pp_P[bp, 1] - pp_P[k0 + kp, 1]
-            z = pp_P[bp, 2] - pp_P[k0 + kp, 2]
-            # R_tuv(alpha, P - Q) into RR[0, :NH(L)]: inlined copy of
-            # hermite.hermite_r (a call with array arguments costs more than
-            # the work here); levels n = L..0 ping-pong between RR[0], RR[1]
-            # and F_n comes from the downward recursion
-            T = alpha * (x * x + y * y + z * z)
-            f = boys_top(L, T)
-            ex = 0.0
-            if L > 0:
-                ex = math.exp(-T)
-            m2a = -2.0 * alpha
-            pw = 1.0
-            for _ in range(L):
-                pw *= m2a
-            for n in range(L, -1, -1):
-                if n < L:
-                    f = (2.0 * T * f + ex) * INV_ODD[n]
-                cur = n & 1
-                prv = 1 - cur
-                RR[cur, 0] = pw * f
-                for h in range(1, NHERM[L - n]):
-                    d = HERM_DIR[h]
-                    xd = x if d == 0 else (y if d == 1 else z)
-                    RR[cur, h] = xd * RR[prv, HERM_M1[h]] + HERM_RC[h] * RR[prv, HERM_M2[h]]
-                pw /= m2a
-            for h in range(nhb):
+    for kp in range(pair_pp[pk + 1] - k0):
+        q = pp_ab[k0 + kp, 0] + pp_ab[k0 + kp, 1]
+        alpha = p * q / (p + q)
+        pref = _TWO_PI_2_5 / (p * q * math.sqrt(p + q))
+        x = pp_P[bp, 0] - pp_P[k0 + kp, 0]
+        y = pp_P[bp, 1] - pp_P[k0 + kp, 1]
+        z = pp_P[bp, 2] - pp_P[k0 + kp, 2]
+        # R_tuv(alpha, P - Q) into RR[0, :NH(L)]: inlined copy of
+        # hermite.hermite_r (a call with array arguments costs more than
+        # the work here); levels n = L..0 ping-pong between RR[0], RR[1]
+        # and F_n comes from the downward recursion
+        T2 = alpha * (x * x + y * y + z * z)
+        f = boys_top(L, T2)
+        ex = 0.0
+        if L > 0:
+            ex = math.exp(-T2)
+        m2a = -2.0 * alpha
+        pw = 1.0
+        for _ in range(L):
+            pw *= m2a
+        for n in range(L, -1, -1):
+            if n < L:
+                f = (2.0 * T2 * f + ex) * INV_ODD[n]
+            cur = n & 1
+            prv = 1 - cur
+            RR[cur, 0] = pw * f
+            for h in range(1, NHERM[L - n]):
+                d = HERM_DIR[h]
+                xd = x if d == 0 else (y if d == 1 else z)
+                RR[cur, h] = xd * RR[prv, HERM_M1[h]] + HERM_RC[h] * RR[prv, HERM_M2[h]]
+            pw /= m2a
+        if nkc == 1:
+            # segmented ket: fold its coefficient into the scalar
+            pc = pref * pp_C[k0 + kp, 0]
+            for h in range(nh):
+                for k in range(nhk):
+                    r = pc * RR[0, hidx[h, k]]
+                    if r == 0.0:
+                        continue
+                    for cd in range(ncd):
+                        X[h, cd] += r * Ek[kp, k, cd]
+        else:
+            # general ket: contract over k once, then spread over contractions
+            for h in range(nh):
+                for cd in range(ncd):
+                    T[cd] = 0.0
                 for k in range(nhk):
                     r = pref * RR[0, hidx[h, k]]
                     if r == 0.0:
                         continue
                     for cd in range(ncd):
-                        X[h, cd] += r * Ek[kp, k, cd]
+                        T[cd] += r * Ek[kp, k, cd]
+                for ckl in range(nkc):
+                    c = pp_C[k0 + kp, ckl]
+                    if c == 0.0:
+                        continue
+                    o = ckl * ncd
+                    for cd in range(ncd):
+                        X[h, o + cd] += c * T[cd]
+
+
+@njit(cache=True)
+def _eri_block(pb, pk, pair_pp, pair_blocks, blk_l, blk_ncon, pp_ab, pp_P, pp_E, pp_C,
+               block, Ek, X, T, W, RR, hidx):
+    """block[r, s] = (IJ|KL) for bra block pair pb and ket block pair pk (layout above)."""
+    si = pair_blocks[pb, 0]
+    sj = pair_blocks[pb, 1]
+    sk = pair_blocks[pk, 0]
+    sl = pair_blocks[pk, 1]
+    li = blk_l[si]
+    lj = blk_l[sj]
+    a0 = CART_OFF[li]
+    nci = CART_OFF[li + 1] - a0
+    b0 = CART_OFF[lj]
+    ncj = CART_OFF[lj + 1] - b0
+    nab, nbc = _pair_dims(pb, pair_blocks, blk_l, blk_ncon)
+    ncd, nkc = _pair_dims(pk, pair_blocks, blk_l, blk_ncon)
+    ncol = nkc * ncd
+    Lab = li + lj
+    L = Lab + blk_l[sk] + blk_l[sl]
+    nhb = NHERM[Lab]
+    nhk = NHERM[blk_l[sk] + blk_l[sl]]
+    _hidx_fill(nhb, nhk, hidx)
+    _ket_hermite(pk, pair_pp, pair_blocks, blk_l, pp_E, Ek)
+    for r in range(nbc * nab):
+        for col in range(ncol):
+            block[r, col] = 0.0
+    for bp in range(pair_pp[pb], pair_pp[pb + 1]):
+        _ket_r_contract(bp, pk, nhb, L, pair_pp, pp_ab, pp_P, pp_C, Ek, nhk, ncd, nkc,
+                        X, T, RR, hidx)
+        # bra Hermite expansion: segmented bra -> straight into block (with
+        # its coefficient), general bra -> W[ab, :], then into every cij
+        cb = pp_C[bp, 0] if nbc == 1 else 1.0
         E = pp_E[bp]
         for ia in range(nci):
             ax = CART_LXYZ[a0 + ia, 0]
             ay = CART_LXYZ[a0 + ia, 1]
             az = CART_LXYZ[a0 + ia, 2]
-            fa = CART_FAC[a0 + ia]
+            fa = cb * CART_FAC[a0 + ia]
             for ib in range(ncj):
                 bx = CART_LXYZ[b0 + ib, 0]
                 by = CART_LXYZ[b0 + ib, 1]
                 bz = CART_LXYZ[b0 + ib, 2]
                 f = fa * CART_FAC[b0 + ib]
                 ab = ia * ncj + ib
+                out = block[ab] if nbc == 1 else W[ab]
+                if nbc != 1:
+                    for col in range(ncol):
+                        out[col] = 0.0
                 for t in range(ax + bx + 1):
                     et = f * E[0, ax, bx, t]
                     for u in range(ay + by + 1):
@@ -747,114 +829,124 @@ def _eri_block(pb, pk, pair_pp, pair_shells, shell_l, pp_ab, pp_P, pp_E,
                         for v in range(az + bz + 1):
                             e = etu * E[2, az, bz, v]
                             h = HERM_IDX[t, u, v]
-                            for cd in range(ncd):
-                                block[ab, cd] += e * X[h, cd]
+                            for col in range(ncol):
+                                out[col] += e * X[h, col]
+        if nbc != 1:
+            for cij in range(nbc):
+                c = pp_C[bp, cij]
+                if c == 0.0:
+                    continue
+                for ab in range(nab):
+                    r = cij * nab + ab
+                    for col in range(ncol):
+                        block[r, col] += c * W[ab, col]
 
 
 @njit(cache=True)
-def _scratch(lmax, maxpp, deriv):
+def _scratch(lmax, maxpp, maxrow, deriv):
     """
-    Work arrays sized for the largest shell quartet. Uninitialized: every
+    Work arrays sized for the largest block quartet. Uninitialized: every
     kernel writes the part it uses before reading it.
     """
     nc = (lmax + 1) * (lmax + 2) // 2
     nhp = NHERM[2 * lmax + deriv]
     nR = NHERM[4 * lmax + deriv]
-    block = np.empty((nc * nc, nc * nc))
+    block = np.empty((maxrow, maxrow))
     Ek = np.empty((maxpp, NHERM[2 * lmax], nc * nc))
-    X = np.empty((nhp, nc * nc))
+    X = np.empty((nhp, maxrow))
+    T = np.empty(nc * nc)
+    W = np.empty((nc * nc, maxrow))
     RR = np.empty((2, nR))
     hidx = np.empty((nhp, NHERM[2 * lmax]), dtype=np.int64)
-    return block, Ek, X, RR, hidx
-
-
-@njit(cache=True)
-def _pair_ncart(ip, pair_shells, shell_l):
-    li = shell_l[pair_shells[ip, 0]]
-    lj = shell_l[pair_shells[ip, 1]]
-    return (CART_OFF[li + 1] - CART_OFF[li]) * (CART_OFF[lj + 1] - CART_OFF[lj])
+    return block, Ek, X, T, W, RR, hidx
 
 
 @njit(cache=True, parallel=True)
-def _schwarz_kernel(pair_pp, pair_shells, shell_l, pp_ab, pp_P, pp_E, lmax, maxpp, chunk_first):
-    """Q[ij] = max_ab |(ab|ab)|^(1/2) over each shell pair."""
-    npair = pair_shells.shape[0]
+def _schwarz_kernel(pair_pp, pair_blocks, blk_l, blk_ncon, pp_ab, pp_P, pp_E, pp_C,
+                    lmax, maxpp, maxrow, chunk_first):
+    """Q[ij] = max_ab |(ab|ab)|^(1/2) over each block pair (all its contractions)."""
+    npair = pair_blocks.shape[0]
     nchunk = chunk_first.shape[0]
     Q = np.zeros(npair)
     for c in prange(nchunk):
         if chunk_first[c] >= npair:
             continue
-        block, Ek, X, RR, hidx = _scratch(lmax, maxpp, 0)
+        block, Ek, X, T, W, RR, hidx = _scratch(lmax, maxpp, maxrow, 0)
         for ip in range(chunk_first[c], npair, nchunk):
-            _eri_block(ip, ip, pair_pp, pair_shells, shell_l, pp_ab, pp_P, pp_E,
-                       block, Ek, X, RR, hidx)
+            _eri_block(ip, ip, pair_pp, pair_blocks, blk_l, blk_ncon, pp_ab, pp_P, pp_E, pp_C,
+                       block, Ek, X, T, W, RR, hidx)
+            nab, nbc = _pair_dims(ip, pair_blocks, blk_l, blk_ncon)
             m = 0.0
-            for ab in range(_pair_ncart(ip, pair_shells, shell_l)):
-                m = max(m, abs(block[ab, ab]))
+            for r in range(nab * nbc):
+                m = max(m, abs(block[r, r]))
             Q[ip] = math.sqrt(m)
     return Q
 
 
 @njit(cache=True, parallel=True)
-def _eri_tensor_kernel(pair_pp, pair_shells, shell_l, shell_ao, pp_ab, pp_P, pp_E,
-                       lmax, maxpp, Q, threshold, chunk_first, eri):
+def _eri_tensor_kernel(pair_pp, pair_blocks, blk_l, blk_ncon, blk_ao, pp_ab, pp_P, pp_E, pp_C,
+                       lmax, maxpp, maxrow, Q, threshold, chunk_first, eri):
     """
-    Writes (mn|ls) and its bra/ket-internal permutations for unique quartets
-    (bra pair >= ket pair), halving diagonal (bra == ket) quartets;
+    Writes (mn|ls) and its bra/ket-internal permutations for unique block
+    quartets (bra pair >= ket pair), halving diagonal (bra == ket) quartets;
     _symmetrize_pairs then adds the bra-ket transpose.
     """
-    npair = pair_shells.shape[0]
+    npair = pair_blocks.shape[0]
     nchunk = chunk_first.shape[0]
     for c in prange(nchunk):
         if chunk_first[c] >= npair:
             continue
-        block, Ek, X, RR, hidx = _scratch(lmax, maxpp, 0)
+        block, Ek, X, T, W, RR, hidx = _scratch(lmax, maxpp, maxrow, 0)
         for p1 in range(chunk_first[c], npair, nchunk):
             for p2 in range(p1 + 1):
                 if Q[p1] * Q[p2] < threshold:
                     continue
-                # the cost scales with the ket's component count: put the
+                # the cost scales with the ket's column count: put the
                 # smaller pair in the ket
-                swapped = _pair_ncart(p1, pair_shells, shell_l) < _pair_ncart(p2, pair_shells, shell_l)
+                n1, c1 = _pair_dims(p1, pair_blocks, blk_l, blk_ncon)
+                n2, c2 = _pair_dims(p2, pair_blocks, blk_l, blk_ncon)
+                swapped = n1 * c1 < n2 * c2
                 if swapped:
-                    _eri_block(p2, p1, pair_pp, pair_shells, shell_l, pp_ab, pp_P, pp_E,
-                               block, Ek, X, RR, hidx)
+                    _eri_block(p2, p1, pair_pp, pair_blocks, blk_l, blk_ncon, pp_ab, pp_P, pp_E,
+                               pp_C, block, Ek, X, T, W, RR, hidx)
                 else:
-                    _eri_block(p1, p2, pair_pp, pair_shells, shell_l, pp_ab, pp_P, pp_E,
-                               block, Ek, X, RR, hidx)
+                    _eri_block(p1, p2, pair_pp, pair_blocks, blk_l, blk_ncon, pp_ab, pp_P, pp_E,
+                               pp_C, block, Ek, X, T, W, RR, hidx)
                 scale = 0.5 if p1 == p2 else 1.0
                 # always write rows (m n) of the outer pair p1: the rows stay in
                 # cache across the inner p2 loop
-                si = pair_shells[p1, 0]
-                sj = pair_shells[p1, 1]
-                sk = pair_shells[p2, 0]
-                sl = pair_shells[p2, 1]
-                oi = shell_ao[si]
-                oj = shell_ao[sj]
-                ok = shell_ao[sk]
-                ol = shell_ao[sl]
-                nci = shell_ao[si + 1] - oi
-                ncj = shell_ao[sj + 1] - oj
-                nck = shell_ao[sk + 1] - ok
-                ncl = shell_ao[sl + 1] - ol
-                for a in range(nci):
-                    m = oi + a
-                    for b in range(ncj):
-                        n = oj + b
-                        ab = a * ncj + b
-                        for cc in range(nck):
-                            lam = ok + cc
-                            for d in range(ncl):
-                                sig = ol + d
-                                cd = cc * ncl + d
-                                if swapped:
-                                    v = scale * block[cd, ab]
-                                else:
-                                    v = scale * block[ab, cd]
-                                eri[m, n, lam, sig] = v
-                                eri[n, m, lam, sig] = v
-                                eri[m, n, sig, lam] = v
-                                eri[n, m, sig, lam] = v
+                si = pair_blocks[p1, 0]
+                sj = pair_blocks[p1, 1]
+                sk = pair_blocks[p2, 0]
+                sl = pair_blocks[p2, 1]
+                nci = CART_OFF[blk_l[si] + 1] - CART_OFF[blk_l[si]]
+                ncj = CART_OFF[blk_l[sj] + 1] - CART_OFF[blk_l[sj]]
+                nck = CART_OFF[blk_l[sk] + 1] - CART_OFF[blk_l[sk]]
+                ncl = CART_OFF[blk_l[sl] + 1] - CART_OFF[blk_l[sl]]
+                nqj = blk_ncon[sj]
+                nql = blk_ncon[sl]
+                for qi in range(blk_ncon[si]):
+                    for a in range(nci):
+                        m = blk_ao[si] + qi * nci + a
+                        for qj in range(nqj):
+                            for b in range(ncj):
+                                n = blk_ao[sj] + qj * ncj + b
+                                r1 = (qi * nqj + qj) * n1 + a * ncj + b
+                                for qk in range(blk_ncon[sk]):
+                                    for cc in range(nck):
+                                        lam = blk_ao[sk] + qk * nck + cc
+                                        for ql in range(nql):
+                                            for d in range(ncl):
+                                                sig = blk_ao[sl] + ql * ncl + d
+                                                r2 = (qk * nql + ql) * n2 + cc * ncl + d
+                                                if swapped:
+                                                    v = scale * block[r2, r1]
+                                                else:
+                                                    v = scale * block[r1, r2]
+                                                eri[m, n, lam, sig] = v
+                                                eri[n, m, lam, sig] = v
+                                                eri[m, n, sig, lam] = v
+                                                eri[n, m, sig, lam] = v
 
 
 @njit(cache=True, parallel=True)
@@ -876,13 +968,17 @@ def _symmetrize_pairs(M):
 
 
 def schwarz_bounds(basis: BasisSet) -> np.ndarray:
-    """Q_P = max_{ab in P} |(ab|ab)|^(1/2) per shell pair P = i(i+1)/2 + j (cached)."""
+    """
+    Q_P = max_{ab in P} |(ab|ab)|^(1/2) per pair P = i(i+1)/2 + j of the
+    basis's contraction blocks (``basis.blk_*``; cached).
+    """
     _check_lmax(basis)
     Q = basis._cache.get("schwarz")
     if Q is None:
         pr = _pairs(basis)
-        Q = _schwarz_kernel(pr.pair_pp, pr.pair_shells, basis.shell_l, pr.pp_ab, pr.pp_P,
-                            pr.pp_E, basis.lmax, pr.maxpp, CHUNK_FIRST)
+        Q = _schwarz_kernel(pr.pair_pp, pr.pair_blocks, basis.blk_l, basis.blk_ncon, pr.pp_ab,
+                            pr.pp_P, pr.pp_E, pr.pp_C, basis.lmax, pr.maxpp, pr.maxrow,
+                            CHUNK_FIRST)
         basis._cache["schwarz"] = Q
     return Q
 
@@ -903,8 +999,8 @@ def eri_tensor(basis: BasisSet, schwarz_threshold: float = DEFAULT_SCHWARZ,
     pr = _pairs(basis)
     Q = schwarz_bounds(basis)
     eri = np.zeros((n, n, n, n))
-    _eri_tensor_kernel(pr.pair_pp, pr.pair_shells, basis.shell_l, basis.shell_ao, pr.pp_ab,
-                       pr.pp_P, pr.pp_E, basis.lmax, pr.maxpp, Q,
+    _eri_tensor_kernel(pr.pair_pp, pr.pair_blocks, basis.blk_l, basis.blk_ncon, basis.blk_ao,
+                       pr.pp_ab, pr.pp_P, pr.pp_E, pr.pp_C, basis.lmax, pr.maxpp, pr.maxrow, Q,
                        float(schwarz_threshold), CHUNK_FIRST, eri)
     _symmetrize_pairs(eri.reshape(n * n, n * n))
     return eri
@@ -951,50 +1047,63 @@ def jk_from_eri(eri: np.ndarray, densities: np.ndarray) -> tuple[np.ndarray, np.
 # ============================================================ ERI gradient
 
 @njit(cache=True)
-def _grad_pass(pb, pk, G, pair_pp, pair_shells, shell_l, pp_ab, pp_P, pp_E,
-               Ek, Gk, Y, X, RR, hidx, out):
+def _grad_pass(pb, pk, G, pair_pp, pair_blocks, blk_l, blk_ncon, pp_ab, pp_P, pp_E, pp_C,
+               Ek, Gk, Gkb, Gb, Y, X, T, RR, hidx, out):
     """
-    out[0, d] = sum_{abcd} G[ab, cd] d(ab|cd)/dA_d and out[1, d] the same for
-    B, where A, B are the centers of bra pair pb (ket pair pk is held fixed).
+    out[0, d] = sum_{rs} G[r, s] d(IJ|KL)_{rs}/dA_d and out[1, d] the same
+    for B, where A, B are the centers of bra block pair pb (ket pair pk is
+    held fixed; layout of G as of the ERI block).
 
     The bra-center derivatives use shifted Hermite expansions,
-    d/dA_x -> 2a E^{i+1,j}_t - i E^{i-1,j}_t (t <= l_a + l_b + 1). G is
-    contracted with the ket either before the R contraction (Gk[kp, ab, k],
-    cost ~ nab per primitive quartet) or after it (X[h, cd], cost ~ ncd),
-    whichever side has fewer Cartesian components.
+    d/dA_x -> 2a E^{i+1,j}_t - i E^{i-1,j}_t (t <= l_a + l_b + 1). Per bra
+    primitive pair, G is first reduced to the effective primitive-pair
+    density Gb[ab, s] = sum_cij C_bp[cij] G[(cij, ab), s] (for a general
+    bra; a segmented bra folds its coefficient into a scalar). G is then
+    contracted with the ket either before the R contraction (Gk, cost ~ nab
+    per primitive quartet) or after it (X[h, s], cost ~ ncd x ket
+    contractions), whichever side is smaller.
     """
-    si = pair_shells[pb, 0]
-    sj = pair_shells[pb, 1]
-    sk = pair_shells[pk, 0]
-    sl = pair_shells[pk, 1]
-    li = shell_l[si]
-    lj = shell_l[sj]
-    lk = shell_l[sk]
-    ll = shell_l[sl]
+    si = pair_blocks[pb, 0]
+    sj = pair_blocks[pb, 1]
+    sk = pair_blocks[pk, 0]
+    sl = pair_blocks[pk, 1]
+    li = blk_l[si]
+    lj = blk_l[sj]
+    lk = blk_l[sk]
+    ll = blk_l[sl]
     a0 = CART_OFF[li]
     nci = CART_OFF[li + 1] - a0
     b0 = CART_OFF[lj]
     ncj = CART_OFF[lj + 1] - b0
-    nab = nci * ncj
-    ncd = (CART_OFF[lk + 1] - CART_OFF[lk]) * (CART_OFF[ll + 1] - CART_OFF[ll])
+    nab, nbc = _pair_dims(pb, pair_blocks, blk_l, blk_ncon)
+    ncd, nkc = _pair_dims(pk, pair_blocks, blk_l, blk_ncon)
+    nrow = nbc * nab
+    ncol = nkc * ncd
     Lab = li + lj
     L = Lab + lk + ll + 1
     nh1 = NHERM[Lab + 1]
     nhk = NHERM[lk + ll]
-    use_x = ncd < nab
+    use_x = ncol < nab
     _hidx_fill(nh1, nhk, hidx)
-    _ket_hermite(pk, pair_pp, pair_shells, shell_l, pp_E, Ek)
+    _ket_hermite(pk, pair_pp, pair_blocks, blk_l, pp_E, Ek)
     k0 = pair_pp[pk]
     nkp = pair_pp[pk + 1] - k0
+    Gk3 = Gk[:nkp * nrow * nhk].reshape((nkp, nrow, nhk))
+    Gkb3 = Gkb[:nkp * nab * nhk].reshape((nkp, nab, nhk))
     if not use_x:
-        # Gk[kp, ab, k] = sum_cd G[ab, cd] Ek[kp, k, cd]
+        # Gk[kp, r, k] = sum_{ckl, cd} G[r, (ckl, cd)] C_kp[ckl] Ek[kp, k, cd]
         for kp in range(nkp):
-            for ab in range(nab):
+            for r in range(nrow):
+                for cd in range(ncd):
+                    s = 0.0
+                    for ckl in range(nkc):
+                        s += pp_C[k0 + kp, ckl] * G[r, ckl * ncd + cd]
+                    T[cd] = s
                 for k in range(nhk):
                     s = 0.0
                     for cd in range(ncd):
-                        s += G[ab, cd] * Ek[kp, k, cd]
-                    Gk[kp, ab, k] = s
+                        s += T[cd] * Ek[kp, k, cd]
+                    Gk3[kp, r, k] = s
     for d in range(3):
         out[0, d] = 0.0
         out[1, d] = 0.0
@@ -1002,73 +1111,89 @@ def _grad_pass(pb, pk, G, pair_pp, pair_shells, shell_l, pp_ab, pp_P, pp_E,
         a = pp_ab[bp, 0]
         b = pp_ab[bp, 1]
         p = a + b
+        cb = pp_C[bp, 0] if nbc == 1 else 1.0
         if use_x:
-            for h in range(nh1):
-                for cd in range(ncd):
-                    X[h, cd] = 0.0
+            _ket_r_contract(bp, pk, nh1, L, pair_pp, pp_ab, pp_P, pp_C, Ek, nhk, ncd, nkc,
+                            X, T, RR, hidx)
+            if nbc != 1:
+                for ab in range(nab):
+                    for col in range(ncol):
+                        Gb[ab, col] = 0.0
+                for cij in range(nbc):
+                    c = pp_C[bp, cij]
+                    if c == 0.0:
+                        continue
+                    for ab in range(nab):
+                        for col in range(ncol):
+                            Gb[ab, col] += c * G[cij * nab + ab, col]
         else:
+            if nbc != 1:
+                # Gkb[kp, ab, k] = sum_cij C_bp[cij] Gk[kp, (cij, ab), k]
+                for kp in range(nkp):
+                    for ab in range(nab):
+                        for k in range(nhk):
+                            Gkb3[kp, ab, k] = 0.0
+                    for cij in range(nbc):
+                        c = pp_C[bp, cij]
+                        if c == 0.0:
+                            continue
+                        for ab in range(nab):
+                            for k in range(nhk):
+                                Gkb3[kp, ab, k] += c * Gk3[kp, cij * nab + ab, k]
+                Gsrc = Gkb3
+            else:
+                Gsrc = Gk3
             for ab in range(nab):
                 for h in range(nh1):
                     Y[ab, h] = 0.0
-        for kp in range(nkp):
-            q = pp_ab[k0 + kp, 0] + pp_ab[k0 + kp, 1]
-            alpha = p * q / (p + q)
-            pref = _TWO_PI_2_5 / (p * q * math.sqrt(p + q))
-            x = pp_P[bp, 0] - pp_P[k0 + kp, 0]
-            y = pp_P[bp, 1] - pp_P[k0 + kp, 1]
-            z = pp_P[bp, 2] - pp_P[k0 + kp, 2]
-            # R_tuv(alpha, P - Q) into RR[0, :NH(L)]: inlined copy of
-            # hermite.hermite_r (a call with array arguments costs more than
-            # the work here); levels n = L..0 ping-pong between RR[0], RR[1]
-            # and F_n comes from the downward recursion
-            T = alpha * (x * x + y * y + z * z)
-            f = boys_top(L, T)
-            ex = 0.0
-            if L > 0:
-                ex = math.exp(-T)
-            m2a = -2.0 * alpha
-            pw = 1.0
-            for _ in range(L):
-                pw *= m2a
-            for n in range(L, -1, -1):
-                if n < L:
-                    f = (2.0 * T * f + ex) * INV_ODD[n]
-                cur = n & 1
-                prv = 1 - cur
-                RR[cur, 0] = pw * f
-                for h in range(1, NHERM[L - n]):
-                    d = HERM_DIR[h]
-                    xd = x if d == 0 else (y if d == 1 else z)
-                    RR[cur, h] = xd * RR[prv, HERM_M1[h]] + HERM_RC[h] * RR[prv, HERM_M2[h]]
-                pw /= m2a
-            if use_x:
-                for h in range(nh1):
-                    for k in range(nhk):
-                        r = pref * RR[0, hidx[h, k]]
-                        if r == 0.0:
-                            continue
-                        for cd in range(ncd):
-                            X[h, cd] += r * Ek[kp, k, cd]
-            else:
+            for kp in range(nkp):
+                q = pp_ab[k0 + kp, 0] + pp_ab[k0 + kp, 1]
+                alpha = p * q / (p + q)
+                pref = _TWO_PI_2_5 / (p * q * math.sqrt(p + q))
+                x = pp_P[bp, 0] - pp_P[k0 + kp, 0]
+                y = pp_P[bp, 1] - pp_P[k0 + kp, 1]
+                z = pp_P[bp, 2] - pp_P[k0 + kp, 2]
+                # R_tuv(alpha, P - Q), as in _ket_r_contract
+                T2 = alpha * (x * x + y * y + z * z)
+                f = boys_top(L, T2)
+                ex = 0.0
+                if L > 0:
+                    ex = math.exp(-T2)
+                m2a = -2.0 * alpha
+                pw = 1.0
+                for _ in range(L):
+                    pw *= m2a
+                for n in range(L, -1, -1):
+                    if n < L:
+                        f = (2.0 * T2 * f + ex) * INV_ODD[n]
+                    cur = n & 1
+                    prv = 1 - cur
+                    RR[cur, 0] = pw * f
+                    for h in range(1, NHERM[L - n]):
+                        d = HERM_DIR[h]
+                        xd = x if d == 0 else (y if d == 1 else z)
+                        RR[cur, h] = xd * RR[prv, HERM_M1[h]] + HERM_RC[h] * RR[prv, HERM_M2[h]]
+                    pw /= m2a
                 for h in range(nh1):
                     for k in range(nhk):
                         r = pref * RR[0, hidx[h, k]]
                         if r == 0.0:
                             continue
                         for ab in range(nab):
-                            Y[ab, h] += r * Gk[kp, ab, k]
+                            Y[ab, h] += r * Gsrc[kp, ab, k]
         E = pp_E[bp]
         for ia in range(nci):
             ax = CART_LXYZ[a0 + ia, 0]
             ay = CART_LXYZ[a0 + ia, 1]
             az = CART_LXYZ[a0 + ia, 2]
-            fa = CART_FAC[a0 + ia]
+            fa = cb * CART_FAC[a0 + ia]
             for ib in range(ncj):
                 bx = CART_LXYZ[b0 + ib, 0]
                 by = CART_LXYZ[b0 + ib, 1]
                 bz = CART_LXYZ[b0 + ib, 2]
                 f = fa * CART_FAC[b0 + ib]
                 ab = ia * ncj + ib
+                grow = G[ab] if nbc == 1 else Gb[ab]
                 tx = ax + bx
                 ty = ay + by
                 tz = az + bz
@@ -1097,8 +1222,8 @@ def _grad_pass(pb, pk, G, pair_pp, pair_shells, shell_l, pp_ab, pp_P, pp_E,
                             h = HERM_IDX[t, u, v]
                             if use_x:
                                 yv = 0.0
-                                for cd in range(ncd):
-                                    yv += G[ab, cd] * X[h, cd]
+                                for col in range(ncol):
+                                    yv += grow[col] * X[h, col]
                             else:
                                 yv = Y[ab, h]
                             yv *= f
@@ -1120,46 +1245,56 @@ def _grad_pass(pb, pk, G, pair_pp, pair_shells, shell_l, pp_ab, pp_P, pp_E,
 
 
 @njit(cache=True, parallel=True)
-def _eri_grad_kernel(pair_pp, pair_shells, shell_l, shell_atom, shell_ao, pp_ab, pp_P, pp_E,
-                     lmax, maxpp, Q, threshold, Dc, Dx, kfac, chunk_first, grad_parts):
-    npair = pair_shells.shape[0]
+def _eri_grad_kernel(pair_pp, pair_blocks, blk_l, blk_ncon, blk_atom, blk_ao, pp_ab, pp_P, pp_E,
+                     pp_C, lmax, maxpp, maxrow, maxpph, Q, threshold, Dc, Dx, kfac, chunk_first,
+                     grad_parts):
+    npair = pair_blocks.shape[0]
     nchunk = chunk_first.shape[0]
     nx = Dx.shape[0]
     nc = (lmax + 1) * (lmax + 2) // 2
     for chunk in prange(nchunk):
         if chunk_first[chunk] >= npair:
             continue
-        _blk, Ek, X, RR, hidx = _scratch(lmax, maxpp, 1)
-        Gk = np.empty((maxpp, nc * nc, NHERM[2 * lmax]))
+        _blk, Ek, X, T, _W, RR, hidx = _scratch(lmax, maxpp, 1, 1)
+        X = np.empty((NHERM[2 * lmax + 1], maxrow))
+        Gk = np.empty(maxpph * maxrow)
+        Gkb = np.empty(maxpp * nc * nc * NHERM[2 * lmax])
+        Gb = np.empty((nc * nc, maxrow))
         Y = np.empty((nc * nc, NHERM[2 * lmax + 1]))
-        G = np.empty((nc * nc, nc * nc))
-        Gt = np.empty((nc * nc, nc * nc))
+        G = np.empty((maxrow, maxrow))
+        Gt = np.empty((maxrow, maxrow))
         gab = np.zeros((2, 3))
         gcd = np.zeros((2, 3))
         grad = grad_parts[chunk]
         for pb in range(chunk_first[chunk], npair, nchunk):
-            si = pair_shells[pb, 0]
-            sj = pair_shells[pb, 1]
-            oi = shell_ao[si]
-            oj = shell_ao[sj]
-            nci = shell_ao[si + 1] - oi
-            ncj = shell_ao[sj + 1] - oj
-            aA = shell_atom[si]
-            aB = shell_atom[sj]
+            si = pair_blocks[pb, 0]
+            sj = pair_blocks[pb, 1]
+            nci = CART_OFF[blk_l[si] + 1] - CART_OFF[blk_l[si]]
+            ncj = CART_OFF[blk_l[sj] + 1] - CART_OFF[blk_l[sj]]
+            nqi = blk_ncon[si]
+            nqj = blk_ncon[sj]
+            nab = nci * ncj
+            aA = blk_atom[si]
+            aB = blk_atom[sj]
             for pk in range(pb + 1):
-                sk = pair_shells[pk, 0]
-                sl = pair_shells[pk, 1]
-                aC = shell_atom[sk]
-                aD = shell_atom[sl]
+                sk = pair_blocks[pk, 0]
+                sl = pair_blocks[pk, 1]
+                aC = blk_atom[sk]
+                aD = blk_atom[sl]
                 if aA == aB and aB == aC and aC == aD:
                     continue            # one-center quartet: translationally invariant
                 if Q[pb] * Q[pk] == 0.0:
                     continue
-                ok = shell_ao[sk]
-                ol = shell_ao[sl]
-                nck = shell_ao[sk + 1] - ok
-                ncl = shell_ao[sl + 1] - ol
-                # degeneracy of the unique quartet times the 1/2 of E2
+                nck = CART_OFF[blk_l[sk] + 1] - CART_OFF[blk_l[sk]]
+                ncl = CART_OFF[blk_l[sl] + 1] - CART_OFF[blk_l[sl]]
+                nqk = blk_ncon[sk]
+                nql = blk_ncon[sl]
+                ncd = nck * ncl
+                nrow = nqi * nqj * nab
+                ncol = nqk * nql * ncd
+                # 1/2 of E2 times the permutational degeneracy of the unique
+                # block quartet (inside a diagonal pair I == J the loops below
+                # already run over all ordered (contraction, component) pairs)
                 deg = 0.5
                 if si != sj:
                     deg *= 2.0
@@ -1167,52 +1302,57 @@ def _eri_grad_kernel(pair_pp, pair_shells, shell_l, shell_atom, shell_ao, pp_ab,
                     deg *= 2.0
                 if pb != pk:
                     deg *= 2.0
-                # G = deg [Dc_ab Dc_cd - k/2 sum_s (Ds_ac Ds_bd + Ds_ad Ds_bc)]
+                # G = deg [Dc_mn Dc_ls - k/2 sum_s (Ds_ml Ds_ns + Ds_ms Ds_nl)]
                 gmax = 0.0
-                for a in range(nci):
-                    m = oi + a
-                    for b in range(ncj):
-                        n = oj + b
-                        ab = a * ncj + b
-                        for c in range(nck):
-                            lam = ok + c
-                            for d in range(ncl):
-                                sig = ol + d
-                                v = Dc[m, n] * Dc[lam, sig]
-                                for s in range(nx):
-                                    v -= 0.5 * kfac * (Dx[s, m, lam] * Dx[s, n, sig]
-                                                       + Dx[s, m, sig] * Dx[s, n, lam])
-                                v *= deg
-                                G[ab, c * ncl + d] = v
-                                Gt[c * ncl + d, ab] = v
-                                gmax = max(gmax, abs(v))
+                for qi in range(nqi):
+                    for a in range(nci):
+                        m = blk_ao[si] + qi * nci + a
+                        for qj in range(nqj):
+                            for b in range(ncj):
+                                n = blk_ao[sj] + qj * ncj + b
+                                r = (qi * nqj + qj) * nab + a * ncj + b
+                                for qk in range(nqk):
+                                    for c in range(nck):
+                                        lam = blk_ao[sk] + qk * nck + c
+                                        for ql in range(nql):
+                                            for d in range(ncl):
+                                                sig = blk_ao[sl] + ql * ncl + d
+                                                s = (qk * nql + ql) * ncd + c * ncl + d
+                                                v = Dc[m, n] * Dc[lam, sig]
+                                                for x in range(nx):
+                                                    v -= 0.5 * kfac * (Dx[x, m, lam] * Dx[x, n, sig]
+                                                                       + Dx[x, m, sig] * Dx[x, n, lam])
+                                                v *= deg
+                                                G[r, s] = v
+                                                Gt[s, r] = v
+                                                gmax = max(gmax, abs(v))
                 if Q[pb] * Q[pk] * gmax < threshold:
                     continue
                 need_bra = aA != aB
                 need_ket = aC != aD
                 if not need_bra and not need_ket:
-                    # A == B, C == D: one pass, on the pair with more components
-                    if _pair_ncart(pb, pair_shells, shell_l) >= _pair_ncart(pk, pair_shells, shell_l):
-                        _grad_pass(pb, pk, G, pair_pp, pair_shells, shell_l, pp_ab, pp_P, pp_E,
-                                   Ek, Gk, Y, X, RR, hidx, gab)
+                    # A == B, C == D: one pass, on the pair with more columns
+                    if nrow >= ncol:
+                        _grad_pass(pb, pk, G, pair_pp, pair_blocks, blk_l, blk_ncon, pp_ab, pp_P,
+                                   pp_E, pp_C, Ek, Gk, Gkb, Gb, Y, X, T, RR, hidx, gab)
                         for d in range(3):
                             g = gab[0, d] + gab[1, d]
                             grad[aA, d] += g
                             grad[aC, d] -= g
                     else:
-                        _grad_pass(pk, pb, Gt, pair_pp, pair_shells, shell_l, pp_ab, pp_P, pp_E,
-                                   Ek, Gk, Y, X, RR, hidx, gcd)
+                        _grad_pass(pk, pb, Gt, pair_pp, pair_blocks, blk_l, blk_ncon, pp_ab, pp_P,
+                                   pp_E, pp_C, Ek, Gk, Gkb, Gb, Y, X, T, RR, hidx, gcd)
                         for d in range(3):
                             g = gcd[0, d] + gcd[1, d]
                             grad[aC, d] += g
                             grad[aA, d] -= g
                     continue
                 if need_bra:
-                    _grad_pass(pb, pk, G, pair_pp, pair_shells, shell_l, pp_ab, pp_P, pp_E,
-                               Ek, Gk, Y, X, RR, hidx, gab)
+                    _grad_pass(pb, pk, G, pair_pp, pair_blocks, blk_l, blk_ncon, pp_ab, pp_P,
+                               pp_E, pp_C, Ek, Gk, Gkb, Gb, Y, X, T, RR, hidx, gab)
                 if need_ket:
-                    _grad_pass(pk, pb, Gt, pair_pp, pair_shells, shell_l, pp_ab, pp_P, pp_E,
-                               Ek, Gk, Y, X, RR, hidx, gcd)
+                    _grad_pass(pk, pb, Gt, pair_pp, pair_blocks, blk_l, blk_ncon, pp_ab, pp_P,
+                               pp_E, pp_C, Ek, Gk, Gkb, Gb, Y, X, T, RR, hidx, gcd)
                 for d in range(3):
                     if need_bra and need_ket:
                         grad[aA, d] += gab[0, d]
@@ -1373,8 +1513,8 @@ def two_electron_gradient(basis: BasisSet, D_coulomb: np.ndarray,
     pr = _pairs(basis)
     Q = schwarz_bounds(basis)
     parts = np.zeros((NCHUNK, basis.natm, 3))
-    _eri_grad_kernel(pr.pair_pp, pr.pair_shells, basis.shell_l, basis.shell_atom,
-                     basis.shell_ao, pr.pp_ab, pr.pp_P, pr.pp_E, basis.lmax,
-                     pr.maxpp, Q, float(schwarz_threshold), Dc, Dx, float(k_factor),
-                     CHUNK_FIRST, parts)
+    _eri_grad_kernel(pr.pair_pp, pr.pair_blocks, basis.blk_l, basis.blk_ncon, basis.blk_atom,
+                     basis.blk_ao, pr.pp_ab, pr.pp_P, pr.pp_E, pr.pp_C, basis.lmax,
+                     pr.maxpp, pr.maxrow, pr.maxpph, Q, float(schwarz_threshold), Dc, Dx,
+                     float(k_factor), CHUNK_FIRST, parts)
     return parts.sum(axis=0)

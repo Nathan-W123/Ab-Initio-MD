@@ -19,22 +19,25 @@ energy matches PySCF / Psi4 run with Cartesian functions (``cart=True`` /
 One :class:`aimd.qc.scf.SCFSolver` is built in the constructor (basis parsed
 once, SAD atomic densities computed once and cached). Each ``compute`` moves
 the basis to the new positions (O(1)), builds S, h and the ERI tensor once,
-iterates the SCF, and evaluates the gradient from the same shell-pair data
+iterates the SCF, and evaluates the gradient from the same block-pair data
 and Schwarz bounds (cached on the geometry's BasisSet). BLAS is held to one
 thread for the whole call (:mod:`aimd.qc.threads`); the integral kernels run
 on numba threads (``threads`` sets their number for the duration of each
-call; on a machine shared with other busy processes fewer threads can be
-much faster, since OpenMP workers spin-wait for each other). The ERI tensor
-of the last geometry (8 nao^4 bytes) stays cached until the next call at a
-different geometry or :meth:`HFBackend.close`.
+call). :mod:`aimd.qc` defaults libgomp to passive waiting
+(``OMP_WAIT_POLICY``, see :mod:`aimd.qc.threads`): with spinning workers a
+step of water / STO-3G took 104 ms instead of 6 ms while another process
+kept half of the cores busy. The ERI tensor of the last geometry (8 nao^4
+bytes) stays cached until the next call at a different geometry or
+:meth:`HFBackend.close`.
 
 SCF guesses and the density-guess protocol (aimd.backends.base)
 ----------------------------------------------------------------
 The starting density of an SCF is, in order of priority: a density passed to
 :meth:`HFBackend.set_density_guess` (used for the next ``compute`` only,
-e.g. by XL-BOMD; ``info["guess"] = "external"``), the previous converged
-density (``reuse_density=True``, the default; "previous"), or the initial
-guess ``guess`` ("auto" = "sad", or "core" / "gwh"; "init").
+e.g. by XL-BOMD; ``info["guess"] = "external"``), the density returned by
+the previous call (``reuse_density=True``, the default; "previous"; the last
+iterate if that SCF did not converge, usually still the best guess at hand),
+or the initial guess ``guess`` ("auto" = "sad", or "core" / "gwh"; "init").
 ``GradientResult.density`` is the final AO density in the protocol shape:
 the total density (nao, nao) for RHF, [alpha, beta] (2, nao, nao) for UHF.
 
@@ -49,7 +52,10 @@ An SCF that reaches ``max_cycles`` without converging returns the energy,
 gradient, density and dipole of its last iterate (mutually consistent) with
 ``converged=False`` and a message in ``info["warnings"]``; it does not
 raise, and no Python warning is emitted per call (:func:`aimd.md.run_md`
-reports unconverged steps once per run). Other options of
+reports unconverged steps once per run). Positions with two nuclei closer
+than 1e-5 bohr (PySCF's "Ill geometry" limit) raise ValueError rather than
+return E = +inf with a NaN gradient (:func:`aimd.qc.scf.check_nuclear_separation`).
+Other options of
 :class:`~aimd.qc.scf.SCFOptions` (DIIS space, level shift, damping,
 orthogonalization, screening) go through ``scf_options``.
 
@@ -84,7 +90,21 @@ density as guess, default thresholds; 4 cores, 4 numba threads), median:
                                             gradient 0.29 s)
 
 For comparison, the pyscf backend with the same Cartesian basis and
-thresholds (4 OpenMP threads): 11 ms, 31 ms, 1.36 s.
+thresholds (4 OpenMP threads): 11 ms, 31 ms, 1.36 s. Re-measured the same
+way while another process kept ~2-3 of the 4 cores busy (load average 3.4):
+5.9 ms, 18 ms, 0.58 s (ethanol: ERI tensor 0.13 s, SCF iterations 0.08 s,
+ERI gradient 0.34 s).
+
+General contractions (cc-pVDZ) cost about the same as segmented bases of
+the same size: the ERI kernels evaluate each primitive quartet once per
+contraction block (:mod:`aimd.qc.basis`), not once per contracted shell.
+One warm step at a displaced geometry (same machine, default thresholds):
+
+  ethanol / cc-pVDZ (nao 75)   1.0 s   (was 1.4 s with per-shell kernels)
+  Cl2     / 6-31G*  (nao 38)   0.18 s;  cc-pVDZ (nao 38) 0.13 s (was 0.80 s;
+                                        pyscf cart 0.52 s)
+  PCl3    / 6-31G*  (nao 76)   2.2 s;   cc-pVDZ (nao 76) 1.8 s  (was 9.0 s;
+                                        pyscf cart 2.9 s)
 """
 
 from __future__ import annotations
@@ -143,7 +163,7 @@ class HFBackend(ForceBackend):
       max_cycles     Fock builds before giving up (result flagged unconverged)
       guess          initial guess of the first SCF: "auto" (= "sad"), "sad",
                      "core" or "gwh"
-      reuse_density  start each SCF from the previous converged density
+      reuse_density  start each SCF from the previous call's density
       gradient_screening
                      Schwarz threshold of the ERI-derivative contraction
                      (aimd.qc.integrals.DEFAULT_SCHWARZ_GRAD)
@@ -155,6 +175,7 @@ class HFBackend(ForceBackend):
     """
 
     name = "hf"
+    description = "native RHF / UHF, analytic gradients (McMurchie-Davidson, aimd.qc)"
     supports_density_guess = True
 
     def __init__(

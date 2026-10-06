@@ -5,6 +5,8 @@ import pytest
 from aimd.system import MolecularSystem
 
 EXAMPLES = Path(__file__).resolve().parent.parent / "examples"
+# Test-owned inputs; several tests pin numbers measured on these geometries.
+DATA = Path(__file__).resolve().parent / "data"
 
 
 @pytest.fixture
@@ -14,4 +16,4 @@ def h4() -> MolecularSystem:
 
 @pytest.fixture
 def water() -> MolecularSystem:
-    return MolecularSystem.from_xyz(EXAMPLES / "water.xyz")
+    return MolecularSystem.from_xyz(DATA / "water_experimental.xyz")

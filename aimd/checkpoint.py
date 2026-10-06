@@ -7,6 +7,12 @@ checkpoint + restart + M steps is bit-for-bit the same as N + M steps:
   - the system: symbols, positions, velocities, masses, charge, multiplicity
     and the COM / rotation constraint flags (they set N_dof);
   - the step number and simulation time;
+  - a fingerprint of the backend's electronic structure (:func:`backend_fingerprint`:
+    name, method label, basis name, number of AOs, density shape, Cartesian
+    flag), checked by :meth:`Checkpoint.check_backend` / run_md on restart, so
+    a continuation cannot silently move to another potential-energy surface;
+  - optional ``run_info`` from the caller (run_md stores ``write_every``, the
+    CLI also the backend constructor arguments);
   - the integrator's ``state_dict()``: its configuration, the cached
     GradientResult (energy, gradient, density, dipole, info), RNG bit-generator
     states and thermostat variables, including the accumulated thermostat
@@ -30,6 +36,7 @@ from __future__ import annotations
 import json
 import os
 import warnings
+import zipfile
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
@@ -111,6 +118,37 @@ def _sanitize_info(state: dict[str, Any]) -> dict[str, Any]:
     return {**state, "result": {**result, "info": info}}
 
 
+# ── Backend fingerprint ───────────────────────────────────────────────────────
+
+def backend_fingerprint(backend: Any) -> dict[str, Any]:
+    """
+    Identifying electronic-structure settings of ``backend`` as plain data:
+    ``name`` plus, when the backend has them, ``label`` (method, e.g.
+    "RKS(b3lyp)"), ``basis`` (name), ``nao``, ``density_shape`` and ``cart``.
+    Two backends with different fingerprints compute different surfaces (or
+    densities of different meaning), so a checkpoint's cached result and SCF
+    density cannot be carried over between them.
+    """
+    out: dict[str, Any] = {"name": str(getattr(backend, "name", ""))}
+    label = getattr(backend, "label", None)
+    if isinstance(label, str):
+        out["label"] = label
+    basis = getattr(backend, "basis", None)
+    basis = getattr(basis, "name", basis)
+    if isinstance(basis, str):
+        out["basis"] = basis.strip().lower()
+    elif basis is not None:
+        out["basis"] = "custom"
+    for key in ("nao", "cart"):
+        value = getattr(backend, key, None)
+        if isinstance(value, (bool, int, np.integer)):
+            out[key] = value.item() if isinstance(value, np.generic) else value
+    shape = getattr(backend, "density_shape", None)
+    if shape is not None:
+        out["density_shape"] = [int(n) for n in shape]
+    return out
+
+
 # ── Public API ────────────────────────────────────────────────────────────────
 
 @dataclass
@@ -127,12 +165,43 @@ class Checkpoint:
     time_fs: float
     integrator_state: dict[str, Any]
     backend: str = ""                   # name of the backend that wrote it (info)
+    # backend_fingerprint() of that backend ({} for older checkpoints)
+    backend_info: dict[str, Any] = field(default_factory=dict)
+    # caller-supplied run settings (run_md: write_every; CLI: backend kwargs)
+    run_info: dict[str, Any] = field(default_factory=dict)
     _saved: MolecularSystem = field(init=False, repr=False, compare=False)
 
     def __post_init__(self) -> None:
         # Snapshot: running from ``self.system`` must not change what a later
         # restore() puts back (the cached forces belong to these positions).
         self._saved = self.system.copy()
+
+    @property
+    def saved_system(self) -> MolecularSystem:
+        """A copy of the system as it was saved (unaffected by runs from ``system``)."""
+        return self._saved.copy()
+
+    def backend_mismatch(self, backend: Any) -> list[str]:
+        """
+        Fingerprint entries (:func:`backend_fingerprint`) in which ``backend``
+        differs from the one that wrote the checkpoint, as "key: saved -> new"
+        strings; empty if they agree (or the checkpoint predates fingerprints).
+        """
+        if not self.backend_info:
+            return []
+        mine = backend_fingerprint(backend)
+        return [f"{k}: {self.backend_info.get(k)!r} -> {mine.get(k)!r}"
+                for k in sorted(set(self.backend_info) | set(mine))
+                if self.backend_info.get(k) != mine.get(k)]
+
+    def check_backend(self, backend: Any) -> None:
+        """ValueError if ``backend`` is not the electronic structure the checkpoint used."""
+        diff = self.backend_mismatch(backend)
+        if diff:
+            raise ValueError(
+                "the backend differs from the one that wrote the checkpoint ("
+                + "; ".join(diff) + "): continuing would switch to another "
+                "potential-energy surface and reuse the old result / SCF density")
 
     def restore(self, system: MolecularSystem, integrator: "Integrator") -> None:
         """Copy the saved state into ``system`` (in place) and ``integrator``."""
@@ -158,14 +227,42 @@ class Checkpoint:
         return integrator_from_state(backend, self.integrator_state)
 
 
+def check_writable(path: str | Path) -> None:
+    """
+    Fail early (ValueError) if a checkpoint cannot be written to ``path``:
+    a missing or unwritable directory, or ``path`` naming a directory. Creates
+    and removes the temporary file save_checkpoint writes first.
+    """
+    path = Path(path)
+    if path.is_dir():
+        raise ValueError(f"cannot write checkpoint {path}: it is a directory")
+    parent = path.parent
+    if not parent.is_dir():
+        raise ValueError(f"cannot write checkpoint {path}: directory {parent} does not exist")
+    tmp = path.with_name(path.name + ".tmp")
+    existed = tmp.exists()
+    try:
+        with tmp.open("ab"):
+            pass
+    except OSError as e:
+        raise ValueError(f"cannot write checkpoint {path}: {e.strerror or e}") from e
+    if not existed:
+        tmp.unlink(missing_ok=True)
+
+
 def save_checkpoint(
     path: str | Path,
     system: MolecularSystem,
     integrator: "Integrator",
     step: int,
     time_fs: float | None = None,
+    run_info: dict[str, Any] | None = None,
 ) -> Path:
-    """Write a checkpoint of ``system`` + ``integrator`` after ``step`` steps."""
+    """
+    Write a checkpoint of ``system`` + ``integrator`` after ``step`` steps.
+    ``run_info`` (plain data and arrays) is stored as is and comes back as
+    :attr:`Checkpoint.run_info`.
+    """
     path = Path(path)
     if time_fs is None:
         time_fs = step * integrator.timestep_fs
@@ -175,6 +272,8 @@ def save_checkpoint(
         "step": int(step),
         "time_fs": float(time_fs),
         "backend": str(getattr(integrator.backend, "name", "")),
+        "backend_info": backend_fingerprint(integrator.backend),
+        "run": dict(run_info or {}),
         "system": {
             "symbols": list(system.symbols),
             "positions": np.array(system.positions, dtype=float),
@@ -201,12 +300,27 @@ def save_checkpoint(
 
 
 def load_checkpoint(path: str | Path) -> Checkpoint:
-    """Read a checkpoint written by :func:`save_checkpoint` (no pickle)."""
-    with np.load(Path(path), allow_pickle=False) as npz:
+    """
+    Read a checkpoint written by :func:`save_checkpoint` (no pickle).
+
+    A file that is not a checkpoint, or a damaged one (e.g. cut short), raises
+    ValueError; a missing file raises FileNotFoundError.
+    """
+    try:
+        return _load_checkpoint(Path(path))
+    except (zipfile.BadZipFile, EOFError, json.JSONDecodeError,
+            KeyError, TypeError, AttributeError, IndexError) as e:
+        raise ValueError(
+            f"{path} is not a valid aimd checkpoint ({type(e).__name__}: {e})"
+        ) from e
+
+
+def _load_checkpoint(path: Path) -> Checkpoint:
+    with np.load(path, allow_pickle=False) as npz:
         if _META_KEY not in npz.files:
             raise ValueError(f"{path} is not an aimd checkpoint")
         meta = json.loads(str(npz[_META_KEY]))
-        if meta.get("format") != FORMAT:
+        if not isinstance(meta, dict) or meta.get("format") != FORMAT:
             raise ValueError(f"{path} is not an aimd checkpoint")
         if meta.get("version") != VERSION:
             raise ValueError(f"unsupported checkpoint version {meta.get('version')}")
@@ -229,4 +343,6 @@ def load_checkpoint(path: str | Path) -> Checkpoint:
         time_fs=float(data["time_fs"]),
         integrator_state=data["integrator"],
         backend=data.get("backend", ""),
+        backend_info=data.get("backend_info") or {},
+        run_info=data.get("run") or {},
     )

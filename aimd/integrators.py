@@ -137,8 +137,12 @@ class Integrator(ABC):
         The integrator type must match. Parameters such as the timestep or
         target temperature are those of ``self``, so they may be changed on a
         restart (the conserved quantity is then not continuous). If the backend
-        supports density guesses, the saved density is passed on as the guess
-        for the next SCF.
+        supports density guesses and starts each SCF from its previous density
+        (``reuse_density``, assumed True when the backend has no such
+        attribute), the saved density is passed on as the guess for the next
+        SCF, which is what the uninterrupted run would have used. A backend
+        with ``reuse_density = False`` gets no guess: it would have started
+        from its initial guess.
         """
         if state.get("integrator") != type(self).__name__:
             raise ValueError(
@@ -153,6 +157,7 @@ class Integrator(ABC):
             result is not None
             and result.density is not None
             and self.backend.supports_density_guess
+            and getattr(self.backend, "reuse_density", True)
         ):
             self.backend.set_density_guess(result.density)
         self.result = result
@@ -398,6 +403,15 @@ class XLBOMD(VelocityVerlet):
                 density is None or np.shape(density) != aux.current.shape
             ):
                 raise ValueError("XL-BOMD history does not match the saved SCF density")
+            # Checked here too: the base class only hands the density to a
+            # backend that reuses densities, and a wrong shape would otherwise
+            # surface mid-step, after the system has been moved.
+            want = getattr(self.backend, "density_shape", None)
+            if aux.initialized and want is not None and aux.current.shape != tuple(want):
+                raise ValueError(
+                    f"XL-BOMD history density shape {aux.current.shape} != the "
+                    f"backend's {tuple(want)}"
+                )
         super().load_state_dict(state)                     # validates the rest
         self.aux = aux
 
@@ -421,10 +435,10 @@ class LangevinBAOAB(Integrator):
         rng: np.random.Generator | int | None = None,
     ) -> None:
         super().__init__(backend, timestep_fs)
-        if temperature_k < 0.0:
-            raise ValueError("temperature_k must be non-negative")
-        if friction_per_fs < 0.0:
-            raise ValueError("friction_per_fs must be non-negative")
+        if not (math.isfinite(temperature_k) and temperature_k >= 0.0):
+            raise ValueError("temperature_k must be finite and non-negative")
+        if not (math.isfinite(friction_per_fs) and friction_per_fs >= 0.0):
+            raise ValueError("friction_per_fs must be finite and non-negative")
         self.temperature_k = float(temperature_k)
         self.friction_per_fs = float(friction_per_fs)
         self.gamma = self.friction_per_fs / FS_TO_AU_TIME   # 1 / au_time
@@ -470,9 +484,11 @@ class LangevinBAOAB(Integrator):
         return {**super().state_dict(), "heat": self.heat, "rng": rng_state(self.rng)}
 
     def load_state_dict(self, state: dict[str, Any]) -> None:
-        super().load_state_dict(state)
-        self.heat = float(state["heat"])
-        self.rng = rng_from_state(state["rng"])
+        if state.get("integrator") == type(self).__name__:
+            # Parsed first, so a damaged state leaves the integrator untouched.
+            heat, rng = float(state["heat"]), rng_from_state(state["rng"])
+        super().load_state_dict(state)                     # validates the type
+        self.heat, self.rng = heat, rng
 
 
 INTEGRATORS: dict[str, type[Integrator]] = {

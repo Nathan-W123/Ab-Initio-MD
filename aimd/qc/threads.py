@@ -18,12 +18,29 @@ scipy wheels) of the OpenBLAS libraries loaded in the process, found once in
 installed; otherwise :func:`limit_blas_threads` does nothing. The setting is
 process-wide while the context is active, so other Python threads using BLAS
 at the same time are limited too.
+
+OpenMP wait policy
+------------------
+numba's ``omp`` threading layer (GNU libgomp) keeps its workers spinning
+after each parallel region by default. When the cores are shared with other
+busy processes, a parallel region then waits for preempted spinners: water /
+STO-3G, one HF energy + gradient with 4 numba threads on 4 cores while
+another process kept ~2.2 cores busy took 104 ms per MD step with the
+default (active) policy and 6.1 ms with ``OMP_WAIT_POLICY=passive`` (4.7 ms
+with one thread); ethanol / 6-31G* (few, long parallel regions) 1.09 s vs
+1.05 s. :func:`prefer_passive_openmp_wait`, called when :mod:`aimd.qc` is
+imported, therefore sets ``OMP_WAIT_POLICY=PASSIVE`` unless the user has set
+it (or ``GOMP_SPINCOUNT``). libgomp reads it once, when numba starts its
+thread pool at the first parallel kernel call, so it has no effect if that
+already happened; other OpenMP runtimes (e.g. the copy PySCF bundles) and
+child processes started later also see the variable.
 """
 
 from __future__ import annotations
 
 import contextlib
 import ctypes
+import os
 import re
 from typing import Callable, Iterator
 
@@ -99,3 +116,14 @@ def limit_blas_threads(n: int | None = 1) -> Iterator[None]:
         for (_, set_), k in zip(pools, old):
             if k > n:
                 set_(k)
+
+
+def prefer_passive_openmp_wait() -> bool:
+    """
+    Set ``OMP_WAIT_POLICY=PASSIVE`` unless ``OMP_WAIT_POLICY`` or
+    ``GOMP_SPINCOUNT`` is already set (module docstring); True if it was set.
+    """
+    if "OMP_WAIT_POLICY" in os.environ or "GOMP_SPINCOUNT" in os.environ:
+        return False
+    os.environ["OMP_WAIT_POLICY"] = "PASSIVE"
+    return True

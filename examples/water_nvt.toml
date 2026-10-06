@@ -1,0 +1,38 @@
+# aimd run --config examples/water_nvt.toml
+# Keys mirror the long flags of `aimd run` (dashes or underscores); flags given
+# on the command line override them. Relative `xyz` / `restart` paths are
+# resolved against this file's directory, output paths against the current one.
+
+xyz = "water.xyz"
+
+# electronic structure: native RHF, analytic gradients
+backend = "hf"
+method = "hf"
+basis = "6-31g*"
+conv_tol = 1e-10            # SCF energy change, Eh
+conv_tol_grad = 1e-7        # SCF orbital gradient
+
+# dynamics: 0.5 fs steps, CSVR (Bussi) thermostat at 300 K, XL-BOMD SCF guesses
+steps = 2000
+dt = 0.5
+thermostat = "csvr"
+temperature = 300.0
+tau = 100.0                 # fs
+xlbomd = true
+xl_k = 5
+remove_rotation = true
+seed = 2024
+
+# output
+trajectory = "water_nvt.xyz"
+energies = "water_nvt_energies.csv"
+velocities = "water_nvt_velocities.xyz"
+dipoles = "water_nvt_dipoles.csv"
+write_every = 1
+print_every = 20
+checkpoint = "water_nvt.npz"
+checkpoint_every = 200
+
+# passed to aimd.backends.hf.HFBackend as keyword arguments
+[backend_options]
+scf_options = { diis_space = 8 }

@@ -365,6 +365,68 @@ def test_f_and_g_shells_vs_pyscf():
     np.testing.assert_allclose(I.two_electron_gradient(b, D, [D], 0.5, schwarz_threshold=0.0), expect, **gtol)
 
 
+def test_general_contractions_form_blocks_that_share_primitives():
+    # Regression (performance): every column of a general contraction used to
+    # become its own segmented shell carrying all shared primitives, so the ERI
+    # kernels recomputed each primitive quartet once per column combination
+    # (Cl / cc-pVDZ: three 11-primitive s shells -> 81 copies of each s
+    # quartet; PCl3 cc-pVDZ step 9 s vs 1.6 s now). The kernels now run over
+    # contraction blocks; check that every primitive pair is stored once.
+    b = _basis("hcl", "cc-pvdz")
+    cl = [B for B in range(b.nblock) if b.blk_atom[B] == 1]
+    # Cl: s (11 prims x 3 contr.), s (diffuse), p (7 x 2), p, d
+    assert [(int(b.blk_l[B]), int(b.blk_ncon[B]), int(b.blk_prim[B + 1] - b.blk_prim[B]))
+            for B in cl] == [(0, 3, 11), (0, 1, 1), (1, 2, 7), (1, 1, 1), (2, 1, 1)]
+    assert b.nshell == 11 and b.nblock == 8 and b.nao == 24      # AO layout unchanged
+    np.testing.assert_array_equal(b.blk_ao, b.shell_ao[b.blk_shell[:-1]])
+    pr = I._pairs(b)
+    seen = set()
+    for ip, (i, j) in enumerate(pr.pair_blocks):
+        for k in range(pr.pair_pp[ip], pr.pair_pp[ip + 1]):
+            key = (int(b.blk_atom[i]), int(b.blk_l[i]), pr.pp_ab[k, 0],
+                   int(b.blk_atom[j]), int(b.blk_l[j]), pr.pp_ab[k, 1])
+            assert key not in seen
+            seen.add(key)
+    # Pople split-valence shells have disjoint exponents: one block per shell
+    p = _basis("hcl", "6-31g*")
+    assert p.nblock == p.nshell and np.all(p.blk_ncon == 1)
+
+
+def test_general_contractions_vs_pyscf():
+    # General contractions in s, p and d (zero-padded columns, an uncontracted
+    # shell repeating one of the exponents -> merged into the block, and a
+    # disjoint shell -> its own block) on three atoms: ERIs and the ERI
+    # gradient against PySCF, covering general bras and kets of both
+    # gradient contraction orders.
+    data = {
+        "O": [[0, [30.0, 0.2, 0.0], [6.0, 0.5, -0.2], [1.2, 0.4, 0.6]], [0, [1.2, 1.0]],
+              [1, [5.0, 0.3, 0.1], [1.1, 0.6, -0.5], [0.3, 0.3, 0.9]],
+              [2, [1.6, 0.7, 0.2], [0.5, 0.4, 0.8]], [2, [0.5, 1.0]], [2, [0.2, 1.0]]],
+        "H": [[0, [4.0, 0.3, 0.1], [0.8, 0.7, 0.4], [0.2, 0.0, 0.8]], [1, [0.9, 1.0]]],
+    }
+    sym = ["O", "H", "H"]
+    pos = np.array([[0.0, 0.1, -0.1], [1.5, 1.1, 0.2], [-1.4, 0.9, 0.4]])
+    b, mol = ref.custom_basis(sym, pos, data)
+    o = [(int(b.blk_l[B]), int(b.blk_ncon[B])) for B in range(b.nblock) if b.blk_atom[B] == 0]
+    assert o == [(0, 3), (1, 2), (2, 3), (2, 1)]
+    assert int(b.blk_ncon.max()) == 3 and (b.nshell, b.nblock) == (15, 8)
+    c = ref.ao_scale(b)
+    # measured: ERI 4.4e-14 (values <= 2.5), gradients 6.7e-13 (values <= 33)
+    np.testing.assert_allclose(I.eri_tensor(b, schwarz_threshold=0.0),
+                               ref.eri_to_ours(mol.intor("int2e"), c), rtol=0, atol=2e-13)
+    rng = np.random.default_rng(23)
+    Da, Db = (ref.random_symmetric(b.nao, rng) for _ in range(2))
+    Dap, Dbp = (ref.density_to_pyscf(X, c) for X in (Da, Db))
+    ip1 = mol.intor("int2e_ip1")
+    for Dc, Dxs, k, ours in [
+        (Dap, [Dap], 0.5, I.two_electron_gradient(b, Da, [Da], 0.5, schwarz_threshold=0.0)),
+        (Dap + Dbp, [Dap, Dbp], 1.0,
+         I.two_electron_gradient(b, Da + Db, [Da, Db], 1.0, schwarz_threshold=0.0)),
+    ]:
+        expect = -2 * _per_atom(mol, np.einsum("xijkl,ijkl->xij", ip1, _gamma(Dc, Dxs, k)))
+        np.testing.assert_allclose(ours, expect, rtol=0, atol=3e-12)
+
+
 def test_nuclear_attraction_with_custom_charges_vs_pyscf():
     # V and its gradient for point charges q_A (not Z_A) on the atoms:
     # V = -sum_A q_A <m|1/r_A|n>; d/dR includes the moving charges.
@@ -493,3 +555,30 @@ def test_input_validation():
         I.nuclear_attraction_matrix(b, charges=[8.0, 1.0])
     with pytest.raises(MemoryError):
         I.eri_tensor(b, max_nao=5)
+
+
+def test_integrals_do_not_lose_digits_far_from_the_origin():
+    # Regression: the product center was formed as P = (a A + b B)/p, so for
+    # a molecule ~1000 bohr from the origin P - C lost ~3 digits (V changed by
+    # 1.1e-11 and one-center ERIs by 8.8e-13 under the shift; a one-center
+    # <s|1/r_A|p_x> on an atom at x = 1e4 bohr came out as 6e-11 instead of
+    # 0). Now P - C = (A - C) - (b/p)(A - B), exact for coincident centers.
+    sym, pos = ref.molecule("hcl", distort=0.05)
+    b0 = build_basis(sym, pos, "6-31g**")
+    D = ref.random_symmetric(b0.nao, np.random.default_rng(12))
+    b = b0.with_positions(pos + 1000.0)
+    # measured after the fix: V 2.2e-13 (|V| <= 250), ERI 1.6e-14, 1e/2e
+    # gradients 6.3e-13 / 1.5e-13; the remaining differences come from the
+    # coordinates themselves (eps * 1000 bohr ~ 1e-13 bohr in each distance)
+    np.testing.assert_allclose(I.nuclear_attraction_matrix(b), I.nuclear_attraction_matrix(b0), rtol=0, atol=1e-12)
+    np.testing.assert_allclose(I.eri_tensor(b), I.eri_tensor(b0), rtol=0, atol=1e-13)
+    np.testing.assert_allclose(I.one_electron_gradient(b, D, D), I.one_electron_gradient(b0, D, D), rtol=0, atol=3e-12)
+    np.testing.assert_allclose(I.two_electron_gradient(b, D, [D], 0.5),
+                               I.two_electron_gradient(b0, D, [D], 0.5), rtol=0, atol=1e-12)
+    # one-center integrals of a far atom: exact zeros by symmetry
+    ar = build_basis(["Ar"], [[1e4, 0.3, 0.1]], "6-31g*")
+    V = I.nuclear_attraction_matrix(ar)
+    odd = ar.ao_lxyz.sum(axis=1) % 2 == 1          # s/d (even) vs p (odd) components
+    assert np.abs(V[np.ix_(~odd, odd)]).max() == 0.0
+    eri = I.eri_tensor(ar)
+    assert np.abs(eri[np.ix_(~odd, ~odd, ~odd, odd)]).max() == 0.0

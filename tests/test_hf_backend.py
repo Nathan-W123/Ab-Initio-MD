@@ -7,6 +7,8 @@ shells, unconverged-SCF handling, and NVE molecular dynamics.
 
 from __future__ import annotations
 
+import dataclasses
+import os
 import warnings
 
 import numpy as np
@@ -335,6 +337,35 @@ def test_unconverged_scf_is_flagged_not_raised(water):
     assert out.unconverged_steps == [0, 1, 2, 3]
 
 
+def test_unconverged_density_is_the_next_previous_guess():
+    """The last iterate of an unconverged SCF seeds the next call (documented
+    "previous" semantics), and that call can then converge."""
+    capped = HFBackend(WATER, basis="6-31g", max_cycles=4)
+    r0 = capped.compute(X)
+    assert not r0.converged
+    capped.solver.options = dataclasses.replace(capped.options, max_iter=100)
+    r1 = capped.compute(X)
+    assert r1.info["guess"] == "previous" and r1.converged and r1.info["warnings"] == []
+    exact = HFBackend(WATER, basis="6-31g", **TIGHT).compute(X)
+    assert r1.energy == pytest.approx(exact.energy, abs=1e-9)
+
+
+def test_linear_dependence_is_reported_in_the_warnings():
+    """
+    Canonical orthogonalization with a threshold above the smallest overlap
+    eigenvalue (0.069 for water / 6-31G at X) drops one combination; the
+    backend must say that the analytic gradient is then not dE/dR. Measured
+    against central differences: 1.6e-2 Eh/bohr off, so the warning matters.
+    """
+    backend = HFBackend(WATER, basis="6-31g", **TIGHT,
+                        scf_options={"orthogonalization": "canonical", "lindep_threshold": 0.1})
+    res = backend.compute(X)
+    assert res.converged and res.info["n_removed"] == 1
+    assert len(res.info["warnings"]) == 1 and "linearly-dependent" in res.info["warnings"][0]
+    fd = finite_difference_gradient(backend, X, step=1e-4)
+    assert np.abs(fd - res.gradient).max() > 1e-3
+
+
 def test_invalid_arguments():
     with pytest.raises(ValueError, match="Unknown basis"):
         HFBackend(WATER, basis="no-such-basis")
@@ -445,3 +476,37 @@ def test_nve_water_conserves_energy_and_momenta(water):
     assert 3.5 < dev_05 / dev_025 < 4.5                       # O(dt^2) Verlet error
     assert max(dp_05, dp_025) < 1e-10
     assert max(dl_05, dl_025) < 1e-5
+
+
+def test_openmp_wait_policy_default_respects_the_user(monkeypatch):
+    """aimd.qc defaults libgomp to passive waiting (aimd.qc.threads) unless set."""
+    from aimd.qc.threads import prefer_passive_openmp_wait
+    monkeypatch.delenv("OMP_WAIT_POLICY", raising=False)
+    monkeypatch.delenv("GOMP_SPINCOUNT", raising=False)
+    assert prefer_passive_openmp_wait()
+    assert os.environ["OMP_WAIT_POLICY"] == "PASSIVE"
+    monkeypatch.setenv("OMP_WAIT_POLICY", "active")
+    assert not prefer_passive_openmp_wait() and os.environ["OMP_WAIT_POLICY"] == "active"
+    monkeypatch.delenv("OMP_WAIT_POLICY")
+    monkeypatch.setenv("GOMP_SPINCOUNT", "1000")
+    assert not prefer_passive_openmp_wait() and "OMP_WAIT_POLICY" not in os.environ
+
+
+def test_coincident_nuclei_are_refused_not_reported_as_converged():
+    # Regression: O(0,0,0), H(1.8,0,0), H(1.8,0,0) returned energy=+inf, a NaN
+    # gradient and converged=True (the electronic integrals stay finite, so the
+    # SCF converged; only Z_A Z_B / R_AB blew up). PySCF raises "Ill geometry"
+    # below 1e-5 bohr; so do the backend and the SCF driver now.
+    for gap in (0.0, 5e-6):
+        x = np.array([[0.0, 0.0, 0.0], [1.8, 0.0, 0.0], [1.8 + gap, 0.0, 0.0]])
+        with warnings.catch_warnings():
+            warnings.simplefilter("error")             # no divide-by-zero on the way
+            with pytest.raises(ValueError, match=r"atoms 1 and 2 .*\(coincident nuclei"):
+                HFBackend(WATER, basis="sto-3g").compute(x)
+            with pytest.raises(ValueError, match="coincident"):
+                S.run_scf(WATER, x, "sto-3g")
+    # just above the threshold the geometry is (absurd but) finite: no refusal
+    x = np.array([[0.0, 0.0, 0.0], [1.8, 0.0, 0.0], [1.8, 1e-4, 0.0]])
+    S.check_nuclear_separation(x, np.array([8, 1, 1]))
+    # a ghost (Z = 0) centre may sit on an atom, as in PySCF
+    S.check_nuclear_separation(np.zeros((2, 3)), np.array([1, 0]))

@@ -11,7 +11,9 @@ H is either a full symmetric positive semi-definite (3N, 3N) ``hessian`` or
 diagonal, built from ``force_constants`` (hartree / bohr^2): a scalar, one per
 atom (N,), or one per Cartesian coordinate (N, 3). ``reference_positions`` x_0
 default to the origin, so atoms are tethered (no translation invariance; the
-total momentum is not conserved).
+total momentum is not conserved). ``aimd run --backend harmonic`` centres the
+wells on the starting geometry instead (aimd.cli), unless
+``--backend-option reference_positions=[...]`` (bohr) is given.
 
 With masses m the normal-mode angular frequencies are the square roots of the
 eigenvalues of M^{-1/2} H M^{-1/2}. Useful closed forms for tests:
@@ -33,6 +35,7 @@ from aimd.backends.registry import register_backend
 @register_backend
 class HarmonicBackend(ForceBackend):
     name = "harmonic"
+    description = "harmonic model surface (not ab initio; tests)"
 
     def __init__(
         self,

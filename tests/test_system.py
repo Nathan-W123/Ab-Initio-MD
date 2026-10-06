@@ -52,7 +52,7 @@ def _random_velocities(system, seed):
     "xyz, n3, after_com, after_rot, n_rot",
     [
         (None, 9, 6, 3, 3),        # water (fixture below), nonlinear
-        (CO2, 9, 6, 4, 2),         # linear triatomic: 3N - 5 internal
+        (CO2, 9, 6, 3, 3),         # linear triatomic: L = 0 is 3 constraints once it bends
         (H2, 6, 3, 1, 2),          # diatomic: one vibration
         (HE, 3, 1, 1, 0),          # single atom: 0 DOF, clamped to 1
     ],
@@ -124,7 +124,7 @@ def test_nearly_linear_molecule_uses_pseudo_inverse():
     v0 = s.velocities.copy()
     s.remove_angular_momentum()
     assert np.abs(s.velocities - v0).max() < 10 * np.abs(v0).max()
-    assert s.rotational_dof == 2
+    assert s.n_rotations() == 2 and s.rotational_dof == 3
 
 
 def test_single_atom_rotation_removal_is_a_no_op():
@@ -147,13 +147,25 @@ def test_initialize_velocities_can_remove_rotation(water):
 
 
 def test_rotational_dof_is_frozen_when_a_linear_molecule_bends():
+    # Regression: a linear polyatomic used to get N_dof = 3N - 5, but velocity
+    # Verlet keeps all three components of L at zero and the molecule bends at
+    # once, so only 3N - 6 velocity directions are accessible (dynamics check
+    # in test_thermostats.py). The count is fixed at removal time.
     s = MolecularSystem.from_xyz_string(CO2)
+    assert s.is_linear() and s.n_rotations() == 2
     s.initialize_velocities(300.0, rng=8, remove_rotation=True)
-    assert s.n_dof == 4
+    assert s.n_dof == 3 and s.temperature() == pytest.approx(300.0)
     s.positions[1, 0] += 0.1                      # bend: now nonlinear
-    assert not s.is_linear() and s.n_dof == 4
+    assert not s.is_linear() and s.n_dof == 3
     c = s.copy()
-    assert (c.com_removed, c.rotation_removed, c.rotational_dof) == (True, True, 2)
+    assert (c.com_removed, c.rotation_removed, c.rotational_dof) == (True, True, 3)
+    # a diatomic cannot bend: 2 constraints
+    h2 = MolecularSystem.from_xyz_string(H2)
+    h2.initialize_velocities(300.0, rng=8, remove_rotation=True)
+    assert h2.rotational_dof == 2 and h2.n_dof == 1
+    # an explicitly stored count (e.g. from an old checkpoint) is honoured
+    assert MolecularSystem(s.symbols, s.positions, com_removed=True, rotation_removed=True,
+                           rotational_dof=2).n_dof == 4
 
 
 def test_zero_temperature_with_rotation_removal(water):

@@ -38,6 +38,9 @@ from a checkpoint. With ``truncate_after_step=s`` anything an earlier run wrote
 for steps > s (for example after its last checkpoint, before it crashed) is cut
 off first, so the continued file is identical to that of an uninterrupted run.
 ``resumed`` tells whether the file already held data after that cut.
+:func:`last_kept_frame` / :func:`last_kept_row` return, without changing the
+file, what that cut would keep last; run_md checks it against the checkpoint
+before appending.
 """
 
 from __future__ import annotations
@@ -82,43 +85,114 @@ def _cut(path: Path, offset: int) -> None:
         fh.truncate(offset)
 
 
+def _scan_xyz(data: bytes, after_step: int) -> tuple[int, list[bytes] | None, bool]:
+    """
+    Walk the frames of an XYZ-layout file up to the first frame whose comment
+    has step > after_step, or an incomplete trailing frame (crash mid-write).
+    Returns (byte offset where the kept frames end, lines of the last kept
+    frame or None, well_formed); well_formed is False if a frame header is not
+    an atom count (then nothing is cut: the file is not ours to edit).
+    """
+    lines = data.splitlines(keepends=True)
+    offset, i, last = 0, 0, None
+    while i < len(lines):
+        try:
+            n = int(lines[i].split()[0])
+        except (IndexError, ValueError):
+            return offset, last, False
+        frame = lines[i : i + 2 + n]
+        complete = len(frame) == 2 + n and frame[-1].endswith(b"\n")
+        m = _STEP_RE.search(frame[1].decode("utf-8", "replace")) if len(frame) > 1 else None
+        if not complete or (m is not None and int(m.group(1)) > after_step):
+            return offset, last, True
+        offset += sum(len(ln) for ln in frame)
+        last = frame
+        i += 2 + n
+    return offset, last, True
+
+
 def _truncate_xyz(path: Path, after_step: int) -> None:
     """
     Drop the first frame whose comment has step > after_step, and everything
     after it; an incomplete trailing frame (crash mid-write) is dropped too.
     """
-    with path.open("rb") as fh:
-        lines = fh.read().splitlines(keepends=True)
-    offset, i = 0, 0
-    while i < len(lines):
-        try:
-            n = int(lines[i].split()[0])
-        except (IndexError, ValueError):
-            return                                 # not a frame header: leave as is
-        frame = lines[i : i + 2 + n]
-        complete = len(frame) == 2 + n and frame[-1].endswith(b"\n")
-        m = _STEP_RE.search(frame[1].decode("utf-8", "replace")) if len(frame) > 1 else None
-        if not complete or (m is not None and int(m.group(1)) > after_step):
-            _cut(path, offset)
-            return
-        offset += sum(len(ln) for ln in frame)
-        i += 2 + n
+    data = path.read_bytes()
+    offset, _, well_formed = _scan_xyz(data, after_step)
+    if well_formed and offset < len(data):
+        _cut(path, offset)
 
 
-def _truncate_csv(path: Path, after_step: int) -> None:
-    """Drop the first data row with step > after_step (or a partial row) and the rest."""
-    with path.open("rb") as fh:
-        lines = fh.read().splitlines(keepends=True)
+def _scan_csv(data: bytes, after_step: int) -> tuple[int, bytes | None, bool]:
+    """CSV analogue of _scan_xyz: (offset, last kept data row or None, well_formed)."""
+    lines = data.splitlines(keepends=True)
     offset = len(lines[0]) if lines else 0
+    last = None
     for ln in lines[1:]:
         try:
             step = int(ln.split(b",", 1)[0])
         except ValueError:
-            return
+            return offset, last, False
         if step > after_step or not ln.endswith(b"\n"):
-            _cut(path, offset)
-            return
+            return offset, last, True
         offset += len(ln)
+        last = ln
+    return offset, last, True
+
+
+def _truncate_csv(path: Path, after_step: int) -> None:
+    """Drop the first data row with step > after_step (or a partial row) and the rest."""
+    data = path.read_bytes()
+    offset, _, well_formed = _scan_csv(data, after_step)
+    if well_formed and offset < len(data):
+        _cut(path, offset)
+
+
+def last_kept_frame(
+    path: str | Path, after_step: int
+) -> tuple[list[str], np.ndarray, dict[str, Any]] | None:
+    """
+    Read-only: the last frame of an XYZ-layout file that restart truncation at
+    ``after_step`` would keep, as (symbols, raw values (N, 3) in the file's
+    units, parsed comment); None if no frame would be kept. ValueError for a
+    file the writers cannot have produced.
+    """
+    path = Path(path)
+    _, frame, well_formed = _scan_xyz(path.read_bytes(), after_step)
+    if not well_formed:
+        raise ValueError(f"{path} is not an XYZ trajectory (a frame header is not an atom count)")
+    if frame is None:
+        return None
+    text = [ln.decode("utf-8", "replace") for ln in frame]
+    try:
+        body = [ln.split() for ln in text[2:]]
+        symbols = [_canonical_label(p[0]) for p in body]
+        values = np.array([p[1:4] for p in body], dtype=float).reshape(-1, 3)
+    except (IndexError, ValueError):
+        raise ValueError(f"{path}: malformed frame ({text[1].strip()!r})") from None
+    return symbols, values, parse_comment(text[1])
+
+
+def last_kept_row(path: str | Path, after_step: int) -> dict[str, float] | None:
+    """
+    Read-only: the last data row of a CSV log that restart truncation at
+    ``after_step`` would keep, column -> float (``step`` as int); None if none.
+    """
+    path = Path(path)
+    data = path.read_bytes()
+    _, row, well_formed = _scan_csv(data, after_step)
+    if not well_formed:
+        raise ValueError(f"{path}: a data row does not start with a step number")
+    if row is None:
+        return None
+    header = next(csv.reader(io.StringIO(data.splitlines()[0].decode())), [])
+    fields_ = next(csv.reader(io.StringIO(row.decode("utf-8", "replace"))), [])
+    values = _parse_row(fields_, len(header))
+    if values is None:
+        raise ValueError(f"{path}: malformed row {row.decode('utf-8', 'replace').strip()!r}")
+    out = dict(zip(header, values))
+    if "step" in out:
+        out["step"] = int(out["step"])
+    return out
 
 
 def check_csv_columns(path: str | Path, columns: list[str]) -> bool:
@@ -438,14 +512,22 @@ def read_xyz(path: str | Path) -> XYZTrajectory:
     """
     All frames of a multi-frame XYZ file (angstrom) as positions in bohr,
     shape (n_frames, N, 3). Every frame must list the same atoms. An
-    incomplete last frame is skipped with a warning.
+    incomplete last frame is skipped with a warning. A velocity file (frames
+    stating a velocity unit, ``units=bohr/au_time``) is refused with a
+    ValueError rather than read as coordinates.
     """
     symbols, values, comments = _read_frames(path)
+    info = [parse_comment(c) for c in comments]
+    for k, d in enumerate(info):
+        if d.get("units") in VELOCITY_UNITS:
+            raise ValueError(f"{path} is a velocity file (frame {k}: units={d['units']}), "
+                             "not positions (velocities are read by read_velocities, "
+                             "aimd analyze vacf / vdos)")
     return XYZTrajectory(
         symbols=symbols,
         positions=values * ANG_TO_BOHR,
         comments=comments,
-        info=[parse_comment(c) for c in comments],
+        info=info,
     )
 
 
@@ -462,7 +544,8 @@ def read_velocities(path: str | Path, units: str | None = None) -> VelocityTraje
     for k, d in enumerate(info):
         unit = d.get("units", units)
         if unit is None:
-            raise ValueError(f"{path}: frame {k} states no velocity unit; pass units=")
+            raise ValueError(f"{path}: frame {k} states no velocity unit (no units= on its "
+                             "comment line); give it with units= (aimd analyze: --units)")
         if unit not in VELOCITY_UNITS:
             raise ValueError(f"{path}: frame {k}: unknown velocity unit {unit!r}")
         scale[k] = VELOCITY_UNITS[unit]

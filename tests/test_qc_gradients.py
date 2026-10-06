@@ -265,10 +265,10 @@ def test_unconverged_results_are_refused_on_request():
 
 def test_parallel_work_chunks_cover_every_pair_once_and_spread_over_threads():
     """
-    The ERI / ERI-gradient kernels give chunk c the shell pairs CHUNK_FIRST[c]
+    The ERI / ERI-gradient kernels give chunk c the block pairs CHUNK_FIRST[c]
     + k NCHUNK. numba's OpenMP backend hands each of T threads a contiguous
     block of chunks; every block must hold one residue class mod T, so that
-    even a molecule with < NCHUNK / T shell pairs uses all threads (with
+    even a molecule with < NCHUNK / T block pairs uses all threads (with
     CHUNK_FIRST[c] = c water / STO-3G ran serially). Bitwise independence of
     the thread count is checked in test_qc_integrals and test_hf_backend.
     """

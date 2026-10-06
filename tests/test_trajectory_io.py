@@ -228,6 +228,10 @@ def test_velocity_units_are_self_describing(h4, tmp_path):
     vel = read_velocities(path)
     assert np.allclose(vel.velocities[0], s.velocities, rtol=1e-15, atol=0.0)
     assert np.array_equal(vel.velocities[1], s.velocities)
+    # ... and the tag keeps a velocity file from being read as positions
+    # (regression: read_xyz took the velocities for angstrom coordinates)
+    with pytest.raises(ValueError, match=r"is a velocity file \(frame 0: units=angstrom/fs\)"):
+        read_xyz(path)
 
     bare = tmp_path / "bare.xyz"
     bare.write_text("1\nstep=0\nH 1e-3 0 0\n")
@@ -366,7 +370,7 @@ def test_reader_rejects_malformed_or_inconsistent_files(tmp_path):
 def test_reader_matches_single_frame_parser():
     from pathlib import Path
 
-    water = Path(__file__).resolve().parent.parent / "examples" / "water.xyz"
+    water = Path(__file__).resolve().parent / "data" / "water_experimental.xyz"
     traj = read_xyz(water)
     ref = MolecularSystem.from_xyz(water)
     assert traj.n_frames == 1 and traj.symbols == ref.symbols

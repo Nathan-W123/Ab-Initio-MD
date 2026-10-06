@@ -269,6 +269,38 @@ def test_non_checkpoint_files_are_rejected(tmp_path):
         load_checkpoint(tmp_path / "future.ckpt")
 
 
+def test_damaged_checkpoints_raise_value_error(h4, tmp_path):
+    """
+    Regression: a checkpoint cut short, or with inconsistent metadata, used to
+    surface as BadZipFile / EOFError / KeyError / AttributeError. A pickled
+    object array is refused rather than unpickled.
+    """
+    s = _start(h4)
+    run_md(s, FACTORIES["nhc"](MorseBackend(s.symbols), 0), 3,
+           checkpoint_path=tmp_path / "ok.ckpt")
+    good = (tmp_path / "ok.ckpt").read_bytes()
+    (tmp_path / "cut.ckpt").write_bytes(good[: len(good) // 2])
+    (tmp_path / "empty.ckpt").write_bytes(b"")
+
+    def write(name, meta, **arrays):
+        with (tmp_path / name).open("wb") as fh:
+            np.savez(fh, __metadata__=np.array(json.dumps(meta)), **arrays)
+
+    head = {"format": "aimd-checkpoint", "version": 1}
+    write("list.ckpt", [1, 2])
+    write("nosystem.ckpt", head)
+    write("dangling.ckpt", {**head, "step": 1, "time_fs": 0.0,
+                            "system": {"__ndarray__": "missing"}})
+    write("pickle.ckpt", {**head, "x": {"__ndarray__": "x"}},
+          x=np.array([{"a": 1}], dtype=object))
+    for name in ("cut", "empty", "list", "nosystem", "dangling", "pickle"):
+        with pytest.raises(ValueError):
+            load_checkpoint(tmp_path / f"{name}.ckpt")
+    with pytest.raises(FileNotFoundError):
+        load_checkpoint(tmp_path / "absent.ckpt")
+    assert load_checkpoint(tmp_path / "ok.ckpt").step == 3
+
+
 def test_appending_to_a_log_with_other_columns_is_refused(h4, tmp_path):
     log = tmp_path / "old.csv"
     log.write_text("step,time_fs,potential_Eh,kinetic_Eh,total_Eh,temperature_K\n0,0,0,0,0,0\n")
@@ -283,6 +315,27 @@ def test_appending_to_a_log_with_other_columns_is_refused(h4, tmp_path):
                    trajectory=traj, energy_log=log, start_step=10)
     # Regression: the refused run must not have cut frames 11..15 already.
     assert traj.read_bytes() == frames
+
+
+def test_restart_refused_by_log_columns_leaves_system_and_integrator_untouched(h4, tmp_path):
+    """
+    Regression: the restart state used to be copied into the system and
+    integrator before the log columns were checked, so a refused restart
+    left them modified.
+    """
+    s = _start(h4)
+    run_md(s, FACTORIES["csvr"](MorseBackend(s.symbols), 1), 5,
+           checkpoint_path=tmp_path / "c.ckpt")
+    log = tmp_path / "old.csv"
+    log.write_text("step,time_fs\n0,0.0\n")
+    target = _start(h4, seed=2)
+    pos, vel = target.positions.copy(), target.velocities.copy()
+    integ = FACTORIES["csvr"](MorseBackend(s.symbols), 1)
+    with pytest.raises(ValueError, match="cannot append"):
+        run_md(target, integ, 3, energy_log=log, restart=tmp_path / "c.ckpt")
+    assert np.array_equal(target.positions, pos) and np.array_equal(target.velocities, vel)
+    assert integ.result is None and integ.thermostat.heat == 0.0
+    assert log.read_text() == "step,time_fs\n0,0.0\n"
 
 
 def test_partially_written_frame_and_row_are_dropped_on_resume(h4, tmp_path):

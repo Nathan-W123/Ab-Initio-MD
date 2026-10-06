@@ -1,5 +1,5 @@
 3
-water, near the HF/STO-3G minimum
-O    0.000000    0.000000    0.117000
-H    0.000000    0.757000   -0.468000
-H    0.000000   -0.757000   -0.468000
+water at the HF/STO-3G minimum (r_OH 0.9894 A, HOH 100.03 deg; max |grad| 1.2e-6 Eh/bohr), COM at origin
+O    0.000000    0.000000    0.071151
+H    0.000000    0.758081   -0.564652
+H    0.000000   -0.758081   -0.564652

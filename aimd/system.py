@@ -14,13 +14,23 @@ Hairer, Lubich & Wanner, *Geometric Numerical Integration*, Sec. IV.2).
 Once they are set to zero the velocities stay in a lower-dimensional subspace:
 
     N_dof = 3N - 3 [P = 0] - n_rot [L = 0],
-    n_rot = 3 (nonlinear), 2 (linear), 0 (single atom).
+    n_rot = 0 (one atom), 2 (two atoms), 3 (three or more atoms).
 
-``n_rot`` is fixed when the rotation is removed, so N_dof stays constant over a
-run even if an initially linear molecule bends (a thermostat needs a fixed
-N_dof). For a linear polyatomic that bends while L = 0 is enforced the third
-component of L also becomes a constraint, so 3N - 5 slightly overcounts; this
-is the usual convention and is irrelevant for diatomics (always linear).
+Linear polyatomics count 3 rotational constraints too, not the textbook 2.
+At an exactly collinear geometry the axial component of L vanishes
+identically, but velocity Verlet conserves all three components of L, and the
+molecule leaves the (measure-zero) collinear manifold on the first bending
+step; from then on L = 0 is three independent constraints and the velocities
+live in a 3N - 6 dimensional space. Counting 3N - 5 would make every
+thermostat target <K> = 2 kT instead of 3/2 kT for a triatomic (CO2 internal
+modes ~4/3 too hot), and CSVR would amplify the round-off P and L until COM
+translation and rotation held ~12% of K. Only a polyatomic that stays exactly
+collinear (velocities strictly along the axis) would need 3N - 5. A diatomic
+is always collinear: 2 constraints.
+
+``n_rot`` is fixed when the rotation is removed (``rotational_dof``), so N_dof
+stays constant over a run. ``n_rotations()`` is the geometric count of the
+current structure (2 if collinear), used to classify geometries.
 """
 
 from __future__ import annotations
@@ -51,8 +61,9 @@ class MolecularSystem:
     com_removed: bool = field(default=False)
     # True once angular momentum about the COM has been removed.
     rotation_removed: bool = field(default=False)
-    # Rotational DOF removed with the angular momentum (3, 2 if linear, 0 for a
-    # single atom). Fixed at removal time; None means "from the current geometry".
+    # Rotational DOF removed with the angular momentum (3, 2 for a diatomic, 0
+    # for a single atom; see the module docstring). Fixed at removal time; None
+    # means n_rotational_constraints().
     rotational_dof: int | None = field(default=None)
 
     def __post_init__(self) -> None:
@@ -76,7 +87,7 @@ class MolecularSystem:
         self.com_removed = bool(self.com_removed)
         self.rotation_removed = bool(self.rotation_removed)
         if self.rotation_removed and self.rotational_dof is None:
-            self.rotational_dof = self.n_rotations()
+            self.rotational_dof = self.n_rotational_constraints()
         if self.rotational_dof is not None:
             self.rotational_dof = int(self.rotational_dof)
             if self.rotational_dof not in (0, 2, 3):
@@ -136,7 +147,7 @@ class MolecularSystem:
             dof -= 3
         if self.rotation_removed:
             rot = self.rotational_dof
-            dof -= self.n_rotations() if rot is None else rot
+            dof -= self.n_rotational_constraints() if rot is None else rot
         return max(dof, 1)
 
     def kinetic_energy(self) -> float:
@@ -181,6 +192,16 @@ class MolecularSystem:
             return 0
         return 2 if self.is_linear() else 3
 
+    def n_rotational_constraints(self) -> int:
+        """
+        Independent constraints that L = 0 imposes on the dynamics: 0 (one
+        atom), 2 (two atoms), 3 (three or more, collinear or not; module
+        docstring).
+        """
+        if self.n_atoms == 1:
+            return 0
+        return 2 if self.n_atoms == 2 else 3
+
     # ── Velocity manipulation ─────────────────────────────────────────────────
 
     def remove_com_motion(self) -> None:
@@ -208,7 +229,7 @@ class MolecularSystem:
         omega = axes @ (inv * (axes.T @ ang))
         self.velocities -= np.cross(omega, r)
         self.rotation_removed = True
-        self.rotational_dof = self.n_rotations()
+        self.rotational_dof = self.n_rotational_constraints()
 
     def initialize_velocities(
         self,
@@ -231,7 +252,7 @@ class MolecularSystem:
             self.velocities = np.zeros_like(self.positions)
             self.com_removed = True
             self.rotation_removed = bool(remove_rotation)
-            self.rotational_dof = self.n_rotations() if remove_rotation else None
+            self.rotational_dof = self.n_rotational_constraints() if remove_rotation else None
             return
         sigma = np.sqrt(KB_AU * temperature_k / self.masses)
         self.velocities = rng.normal(size=self.positions.shape) * sigma[:, None]

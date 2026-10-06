@@ -1,0 +1,6 @@
+4
+methyl radical CH3 (doublet), UHF/6-31G* minimum (planar, r_CH 1.0726 A; max |grad| 5e-7 Eh/bohr); run with --multiplicity 2
+C      0.000000    -0.000000    -0.000000
+H      1.072562    -0.000009    -0.003312
+H     -0.536289     0.928862    -0.003310
+H     -0.536274    -0.928853     0.006622

@@ -5,7 +5,14 @@ Adapted from Quantize's Psi4 backend (backend/psi4/). For MD the geometry is
 passed in bohr and Psi4 is told not to translate, reorient or symmetrise it,
 so gradient rows line up with our atom order at every step.
 
-TODO: reuse the previous step's orbitals as the SCF guess (GUESS READ).
+``conv_tol`` / ``conv_tol_grad`` set Psi4's E_CONVERGENCE / D_CONVERGENCE
+(defaults 1e-10 / 1e-8: MD needs forces converged well beyond Psi4's
+geometry-optimisation defaults). Each step starts from Psi4's default guess;
+the previous step's orbitals are not reused (no density-guess protocol, so
+XL-BOMD is not available with this backend).
+
+Not exercised by the test suite unless Psi4 is installed
+(``conda install -c conda-forge psi4``).
 """
 
 from __future__ import annotations
@@ -22,6 +29,8 @@ from aimd.backends.registry import register_backend
 @register_backend
 class Psi4Backend(ForceBackend):
     name = "psi4"
+    description = "HF / DFT / MP2 analytic gradients through Psi4"
+    requires = ("psi4",)             # optional packages (aimd.backends.backend_dependencies)
 
     def __init__(
         self,
@@ -33,6 +42,8 @@ class Psi4Backend(ForceBackend):
         reference: str | None = None,
         memory: str = "2 GB",
         num_threads: int = 1,
+        conv_tol: float = 1e-10,
+        conv_tol_grad: float = 1e-8,
         output_file: str | None = None,
         options: dict | None = None,
     ) -> None:
@@ -54,9 +65,17 @@ class Psi4Backend(ForceBackend):
 
         if reference is None:
             reference = "rhf" if self.multiplicity == 1 else "uhf"
-        opts = {"basis": self.basis, "reference": reference, "scf_type": "pk"}
+        if conv_tol <= 0.0 or conv_tol_grad <= 0.0:
+            raise ValueError("SCF convergence thresholds must be positive")
+        self.reference = str(reference).strip().lower()
+        opts = {"basis": self.basis, "reference": self.reference, "scf_type": "pk",
+                "e_convergence": float(conv_tol), "d_convergence": float(conv_tol_grad)}
         opts.update(options or {})
         psi4.set_options(opts)
+
+    @property
+    def label(self) -> str:
+        return f"{self.method.upper()} ({self.reference.upper()})"
 
     def _molecule(self, positions: np.ndarray):
         lines = [f"{self.charge} {self.multiplicity}"]

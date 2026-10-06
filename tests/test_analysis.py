@@ -366,6 +366,38 @@ def test_ir_rejects_missing_dipoles():
         analysis.ir_spectrum(np.ones((10, 3)), 0.5, quantum_correction="Harmonic")
 
 
+def test_ir_rejects_bad_temperatures():
+    """
+    Regression: a nan temperature passed the ``<= 0`` check and returned an
+    all-nan spectrum silently; None reached quantum_correction_factor as a
+    TypeError.
+    """
+    mu, _ = _synthetic_dipoles([1000.0], [0.02], 0.5, 400)
+    for temp in (0.0, -10.0, math.nan, math.inf):
+        for kind in ("harmonic", "standard", "schofield"):
+            with pytest.raises(ValueError, match="temperature_k"):
+                analysis.ir_spectrum(mu, 0.5, temperature_k=temp, quantum_correction=kind)
+        for kind in ("standard", "schofield"):
+            with pytest.raises(ValueError, match="temperature_k"):
+                analysis.quantum_correction_factor(np.ones(3), temp, kind)
+    with pytest.raises(ValueError, match="temperature_k"):
+        analysis.quantum_correction_factor(np.ones(3), None, "standard")
+
+
+def test_spectra_reject_bad_frame_spacing_and_nonfinite_velocities():
+    v = np.random.default_rng(18).normal(size=(50, 2, 3))
+    for dt in (0.0, -0.5, math.nan, math.inf):
+        with pytest.raises(ValueError, match="dt_fs"):
+            analysis.vibrational_dos(v, dt)
+        with pytest.raises(ValueError, match="dt_fs"):
+            analysis.velocity_autocorrelation(v, dt)
+        with pytest.raises(ValueError, match="dt_fs"):
+            analysis.ir_spectrum(v[:, 0], dt)
+    v[7, 1, 2] = np.nan
+    with pytest.raises(ValueError, match="nan"):
+        analysis.vibrational_dos(v, 0.5)
+
+
 class PointChargeMorse(MorseBackend):
     """Morse diatomic carrying charges +q / -q: mu = q (r_0 - r_1)."""
 
@@ -585,6 +617,34 @@ def test_bond_lengths_and_angles_of_water():
     assert analysis.bond_angles(x, [(1, 0, 2)], degrees=False)[0] == pytest.approx(
         math.radians(104.52), rel=1e-12)
     assert analysis.bond_angles(x, (0, 1, 2)) == pytest.approx((180 - 104.52) / 2, rel=1e-12)
+
+
+def test_circular_mean_and_unwrapping_of_periodic_series():
+    # von Mises sample about 179 deg (kappa = 40, ~9 deg spread): in (-180, 180]
+    # it straddles the cut. Reference: scipy.stats.circmean / circstd.
+    rng = np.random.default_rng(12)
+    a = np.degrees(rng.vonmises(np.radians(179.0), 40.0, 5000))
+    a = np.mod(a + 180.0, 360.0) - 180.0
+    assert a.min() < -170.0 and a.max() > 170.0
+    m = analysis.circular_mean(a)
+    ref = np.degrees(stats.circmean(np.radians(a), high=np.pi, low=-np.pi))
+    assert abs(np.mod(m - ref + 180.0, 360.0) - 180.0) < 1e-9
+    assert abs(abs(m) - 179.0) < 0.5
+    u = analysis.unwrap_about(a, m)
+    assert np.all(np.abs(u - m) <= 180.0)
+    turns = (u - a) / 360.0                         # whole turns only
+    np.testing.assert_allclose(turns, np.round(turns), rtol=0, atol=1e-12)
+    assert set(np.round(turns)) == {0.0, 1.0} or set(np.round(turns)) == {0.0, -1.0}
+    # for a concentrated sample the linear spread of the unwrapped series is the
+    # circular spread sqrt(-2 ln R) (to O(sigma^3)); plain np.std(a) is ~180 deg
+    circ_sd = np.degrees(stats.circstd(np.radians(a)))
+    assert np.std(u) == pytest.approx(circ_sd, rel=0.01) and np.std(a) > 150.0
+    # radians, nan handling, and a vanishing resultant
+    assert analysis.circular_mean(np.radians(a), degrees=False) == pytest.approx(np.radians(m))
+    assert analysis.circular_mean(np.array([np.nan, 170.0, -170.0])) == pytest.approx(180.0)
+    assert np.isnan(analysis.circular_mean(np.array([0.0, 90.0, 180.0, -90.0])))
+    assert np.isnan(analysis.circular_mean(np.array([np.nan])))
+    assert analysis.unwrap_about(np.array([-179.0, 179.0]), 180.0).tolist() == [181.0, 179.0]
 
 
 def test_dihedral_sign_follows_iupac_definition():

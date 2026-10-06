@@ -142,7 +142,7 @@ class BerendsenThermostat(_RescalingThermostat):
 
     def __init__(self, temperature_k: float, tau_fs: float) -> None:
         super().__init__(temperature_k)
-        if tau_fs <= 0.0:
+        if not tau_fs > 0.0:                      # also rejects NaN
             raise ValueError("tau_fs must be positive")
         self.tau_fs = float(tau_fs)
         self.tau = self.tau_fs * FS_TO_AU_TIME

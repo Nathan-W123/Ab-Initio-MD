@@ -17,6 +17,13 @@ minimum-image convention.
 
 ``degrees=False`` returns radians. Angles that are undefined (a zero-length
 bond, or collinear i-j-k / j-k-l for a dihedral) are nan.
+
+Dihedrals are periodic: a torsion fluctuating about 180 degrees jumps between
+about +179 and -179, so its plain mean and standard deviation are
+meaningless. ``circular_mean`` gives the mean direction, and
+``unwrap_about(phi, circular_mean(phi))`` maps the series into one turn
+around it, after which linear statistics (block averages) apply as long as
+the distribution is concentrated (much narrower than a full turn).
 """
 
 from __future__ import annotations
@@ -109,3 +116,42 @@ def dihedral_angles(
     tiny = 1e-12 * np.maximum(scale, np.finfo(float).tiny)
     undefined = (np.linalg.norm(n1, axis=-1) <= tiny) | (np.linalg.norm(n2, axis=-1) <= tiny)
     return _finish(np.where(undefined, np.nan, phi), single, degrees)
+
+
+def circular_mean(angles: np.ndarray, degrees: bool = True) -> float:
+    """
+    Mean direction atan2(<sin a>, <cos a>) of a series of angles, in
+    (-180, 180] degrees (or (-pi, pi] radians); nan entries are ignored, and
+    the result is nan when no finite angle is left or the resultant vanishes
+    (e.g. a uniform distribution). Mardia & Jupp, *Directional Statistics*
+    (2000), Sec. 2.2.
+    """
+    a = np.asarray(angles, dtype=float).ravel()
+    a = a[np.isfinite(a)]
+    if degrees:
+        a = np.deg2rad(a)
+    if a.size == 0:
+        return float("nan")
+    s, c = np.sin(a).mean(), np.cos(a).mean()
+    if np.hypot(s, c) < 1e-12:
+        return float("nan")
+    m = float(np.arctan2(s, c))
+    if m <= -np.pi:
+        m = float(np.pi)
+    return float(np.rad2deg(m)) if degrees else m
+
+
+def unwrap_about(angles: np.ndarray, center: float, degrees: bool = True) -> np.ndarray:
+    """
+    Angles shifted by whole turns into (center - 180, center + 180] (degrees;
+    (center - pi, center + pi] in radians), so that linear statistics (mean,
+    variance, block averages) of a periodic series concentrated around
+    ``center`` are meaningful: a torsion jittering about 180 degrees reads
+    +179 / -179 in (-180, 180], but 179 / 181 about center 180.
+    """
+    a = np.asarray(angles, dtype=float)
+    turn = 360.0 if degrees else 2.0 * np.pi
+    # (a - center) mod turn in [0, turn) -> (-turn/2, turn/2]
+    d = np.mod(a - center, turn)
+    d = np.where(d > 0.5 * turn, d - turn, d)
+    return center + d

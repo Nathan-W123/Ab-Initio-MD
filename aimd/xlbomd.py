@@ -50,6 +50,10 @@ XL (K=5) 7e-6; PBE/6-31G, BOMD +1.3e-3, XL 1e-4 (K=5), -2.5e-4 (K=7). With
 exactly 3 SCF cycles per step (tight conv_tol, max_cycle=3; such steps are
 reported as unconverged), PBE gives BOMD -3.9e-3, XL -1.4e-4 (K=5),
 -9e-6 (K=7). A fixed, small number of cycles is the usual practice.
+For a threshold-stopped DFT SCF XL-BOMD is not guaranteed to help at all:
+PBE/STO-3G, 500 K, conv_tol 1e-5, two seeds x grid levels 1 and 3 gave
+XL (K=5) +1.8e-3 .. +3.0e-3 Eh/ps against BOMD +5.7e-4 .. +1.6e-3, while
+with exactly 3 cycles XL gave -1.3e-4 .. -6.8e-4 against BOMD -3.1e-2.
 
 Units and representation
 ------------------------

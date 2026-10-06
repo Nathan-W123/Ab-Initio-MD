@@ -526,6 +526,12 @@ def test_unconverged_runs_are_flagged_and_warned():
     assert not r.converged and r.iterations == 3 and len(r.history) == 3
     assert r.commutator_norm > 1e-7
     assert "NOT CONVERGED" in repr(r)
+    # regression: the warning pointed into scf.py (run_scf) instead of the caller
+    for call in (lambda: S.run_scf(sym, pos, "sto-3g", max_iter=2),
+                 lambda: S.SCFSolver(sym, "sto-3g", max_iter=2).run(pos)):
+        with pytest.warns(S.SCFConvergenceWarning) as rec:
+            call()
+        assert rec[0].filename == __file__
     with warnings.catch_warnings():
         warnings.simplefilter("error")
         r = S.run_scf(sym, pos, "6-31g*", max_iter=3, warn_unconverged=False)
@@ -650,15 +656,15 @@ def test_non_finite_positions_raise_instead_of_corrupting_memory():
     # the kernel itself (below the BasisSet check): pairs touching the NaN atom
     # are dropped and every other pair keeps exactly its own primitive pairs
     b = build_basis(sym, pos, "sto-3g")
-    args = (b.shell_atom, b.shell_l, b.shell_prim, b.prim_exp, b.prim_coef)
-    pp_ok, _, ab_ok, _, _ = I._build_pairs(*args, pos)
+    args = (b.blk_atom, b.blk_l, b.blk_prim, b.blk_exp, b.blk_coef, b.blk_ncon)
+    pp_ok, _, ab_ok, _, _, _ = I._build_pairs(*args, pos)
     p = pos.copy()
     p[1, 0] = np.nan
-    pp_nan, shells, ab_nan, _, _ = I._build_pairs(*args, p)
+    pp_nan, blocks, ab_nan, _, _, _ = I._build_pairs(*args, p)
     assert pp_nan[-1] == len(ab_nan)
-    for ip, (i, j) in enumerate(shells):
+    for ip, (i, j) in enumerate(blocks):
         n_nan = pp_nan[ip + 1] - pp_nan[ip]
-        if 1 in (b.shell_atom[i], b.shell_atom[j]):
+        if 1 in (b.blk_atom[i], b.blk_atom[j]):
             assert n_nan == 0
         else:
             np.testing.assert_array_equal(ab_nan[pp_nan[ip]:pp_nan[ip + 1]],
@@ -720,6 +726,14 @@ def test_electron_count_validation():
         S.electron_counts(2, 0, 0)
     with pytest.raises(ValueError, match="RHF needs a closed-shell singlet"):
         S.electron_counts(8, 0, 3, "rhf")
+    # regression: the reference name was not normalized here (SCFSolver did it),
+    # so "RHF" / "Restricted" silently accepted open shells
+    for name in ("RHF", " Restricted "):
+        with pytest.raises(ValueError, match="RHF needs a closed-shell singlet"):
+            S.electron_counts(8, 0, 3, name)
+    assert S.electron_counts(8, 0, 3, "UHF") == (5, 3)
+    with pytest.raises(ValueError, match="unknown reference"):
+        S.electron_counts(8, 0, 3, "rohf")
     sym, _ = ref.molecule("oh")
     with pytest.raises(ValueError, match="impossible"):
         S.SCFSolver(sym, "sto-3g")                     # OH with multiplicity 1

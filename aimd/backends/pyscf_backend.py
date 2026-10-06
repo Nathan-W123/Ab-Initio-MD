@@ -104,7 +104,9 @@ class PySCFBackend(ForceBackend):
     """
 
     name = "pyscf"
+    description = "HF / DFT / MP2 analytic gradients through PySCF"
     supports_density_guess = True
+    requires = ("pyscf",)            # optional packages (aimd.backends.backend_dependencies)
 
     def __init__(
         self,

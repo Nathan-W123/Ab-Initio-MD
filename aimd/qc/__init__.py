@@ -8,6 +8,11 @@ molecular integrals and their nuclear-derivative contractions
 (:mod:`aimd.qc.gradients`). Hartree atomic units throughout.
 """
 
+from aimd.qc.threads import prefer_passive_openmp_wait
+
+# before any numba parallel kernel starts the OpenMP pool (see aimd.qc.threads)
+prefer_passive_openmp_wait()
+
 from aimd.qc import integrals
 from aimd.qc.basis import BasisSet, build_basis
 from aimd.qc.basis_data import available_basis_sets, normalize_basis_name

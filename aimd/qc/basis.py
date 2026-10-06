@@ -41,6 +41,28 @@ Flat layout (numba kernels consume these directly; all int arrays are int64):
     positions[A]                        nuclear positions (bohr); a shell's
                                         center is positions[shell_atom[s]]
 
+General-contraction blocks (used by the ERI kernels): consecutive shells on
+the same atom with the same l whose primitive exponents are nested (one set
+contains the other) form one block. A general contraction (cc-pVDZ: Cl s =
+11 primitives x 3 contractions, plus an uncontracted shell whose exponent may
+repeat one of them) thus becomes a single block holding each primitive once,
+with a coefficient matrix over its contractions; Pople split-valence shells
+(disjoint exponents) stay separate one-contraction blocks. The two-electron
+kernels evaluate each primitive quartet once per block quartet and contract
+it into all contraction combinations, instead of once per combination of
+segmented shells (Cl s: 81 shell quartets of 11^4 primitive quartets each).
+The AOs of block B are ``blk_ao[B] + c * ncart(l) + i`` for contraction c and
+Cartesian component i, i.e. the AOs of its consecutive segmented shells.
+
+    blk_shell[B]:blk_shell[B+1]         segmented shells of block B
+    blk_atom[B], blk_l[B], blk_ncon[B]  atom, l, number of contractions
+    blk_ao[B]                           first AO of the block
+    blk_prim[B]:blk_prim[B+1]           slice of blk_exp / rows of blk_coef
+    blk_exp[k], blk_coef[k, c]          unique exponents; coefficient of
+                                        primitive k in contraction c (0 if
+                                        that contraction does not use it;
+                                        normalization as prim_coef)
+
 Moving atoms only changes ``positions``; :meth:`BasisSet.with_positions`
 returns a new BasisSet sharing every other array (O(1); MD calls it every
 step). Arrays are read-only so cached geometry-dependent data stay valid.
@@ -157,7 +179,53 @@ class BasisSet:
             idx = np.nonzero(self.ao_atom == a)[0]
             rng[a] = (idx[0], idx[-1] + 1) if len(idx) else (0, 0)
         self.atom_ao = _readonly(rng)
+        self._build_blocks()
         self._set_positions(positions)
+
+    def _build_blocks(self) -> None:
+        """General-contraction blocks from the segmented shells (module docstring)."""
+        blk_shell, blk_exp, cols = [0], [], []   # cols: per block, list of {exp: coef}
+        union: list[float] = []
+        for s in range(self.nshell):
+            k0, k1 = self.shell_prim[s], self.shell_prim[s + 1]
+            col: dict[float, float] = {}
+            for e, c in zip(self.prim_exp[k0:k1].tolist(), self.prim_coef[k0:k1].tolist()):
+                col[e] = col.get(e, 0.0) + c         # a repeated exponent is one primitive
+            es = set(col)
+            if (s > 0 and self.shell_atom[s] == self.shell_atom[s - 1]
+                    and self.shell_l[s] == self.shell_l[s - 1]
+                    and (es <= set(union) or set(union) <= es)):
+                union.extend(e for e in col if e not in union)
+                cols[-1].append(col)
+            else:
+                if s > 0:
+                    blk_shell.append(s)
+                    blk_exp.append(union)
+                union = list(col)
+                cols.append([col])
+        if self.nshell:
+            blk_shell.append(self.nshell)
+            blk_exp.append(union)
+        nblk = len(cols)
+        maxcon = max((len(c) for c in cols), default=1)
+        nprim = sum(len(u) for u in blk_exp)
+        coef = np.zeros((nprim, maxcon))
+        prim = [0]
+        for b in range(nblk):
+            for k, e in enumerate(blk_exp[b]):
+                for c, col in enumerate(cols[b]):
+                    coef[prim[-1] + k, c] = col.get(e, 0.0)
+            prim.append(prim[-1] + len(blk_exp[b]))
+        bs = np.array(blk_shell, dtype=np.int64)
+        self.nblock = nblk
+        self.blk_shell = _readonly(bs)
+        self.blk_atom = _readonly(self.shell_atom[bs[:-1]].copy())
+        self.blk_l = _readonly(self.shell_l[bs[:-1]].copy())
+        self.blk_ncon = _readonly(np.diff(bs))
+        self.blk_ao = _readonly(self.shell_ao[bs[:-1]].copy())
+        self.blk_prim = _readonly(np.array(prim, dtype=np.int64))
+        self.blk_exp = _readonly(np.array([e for u in blk_exp for e in u], dtype=float))
+        self.blk_coef = _readonly(coef)
 
     # ------------------------------------------------------------------ geometry
     def _set_positions(self, positions: np.ndarray) -> None:
@@ -212,7 +280,7 @@ class BasisSet:
 
     def __repr__(self) -> str:
         return (f"BasisSet({self.name!r}, natm={self.natm}, nshell={self.nshell}, "
-                f"nao={self.nao}, nprim={self.nprim})")
+                f"nao={self.nao}, nprim={self.nprim}, nblock={self.nblock})")
 
 
 def _readonly(a: np.ndarray) -> np.ndarray:
