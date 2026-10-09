@@ -21,6 +21,7 @@ pip install -e ".[dev]"
 aimd run examples/water.xyz --basis 6-31g* --temperature 300 --steps 200 \
     --thermostat csvr --dipoles dipoles.csv --velocities velocities.xyz --seed 1
 aimd analyze ir dipoles.csv --temperature 300
+aimd view trajectory.xyz          # interactive HTML movie with energy charts
 ```
 
 ## Contents
@@ -174,6 +175,7 @@ aimd/
   trajectory.py           XYZ / velocity / CSV writers and readers
   analysis/               rdf, geometry, spectra, statistics
   cli.py, cli_analyze.py  the `aimd` command
+  viewer.py               `aimd view`: self-contained HTML trajectory viewer
   testing.py              finite-difference gradient check for new backends
 examples/                 geometries and config files (below)
 tests/                    pytest suite
@@ -337,6 +339,37 @@ aimd analyze stats energies.csv --skip 200 -o stats.csv       # block-averaged e
 
 Distances are in Å, angles in degrees, times in fs and wavenumbers in
 cm⁻¹. Atom indices are 0-based.
+
+### `aimd view`
+
+Writes one HTML file that plays a trajectory in any browser, offline: the
+frames, the energy log and a small canvas renderer are embedded, with no
+external scripts.
+
+```bash
+aimd view trajectory.xyz                         # -> trajectory.html
+aimd view run.xyz --energies run_e.csv -o movie.html --every 2
+```
+
+- Ball-and-stick molecule: drag to rotate, wheel or pinch to zoom; play /
+  pause (space), step (arrow keys), frame slider, playback speed, loop, and
+  0-based atom index labels (the indices `aimd analyze geometry` takes).
+- Bonds are recomputed for every frame from covalent radii (bonded if
+  r < r_cov,i + r_cov,j + 0.4 Å, `--bond-tolerance`), so bonds that break or
+  form appear and disappear. The fragments of each frame are listed as Hill
+  formulas (e.g. `H2O`, then `HO + H` after a dissociation), in red once they
+  differ from the first frame.
+- With an energy log (`--energies`; by default `<stem>_energies.csv` or
+  `energies.csv` next to the trajectory is used if present, `none` to leave
+  it out): the change of E_pot, E_tot and the conserved energy from their
+  first values in kcal/mol (the conserved energy is a flat line at 0 in a
+  healthy run), and the temperature, with a cursor following the movie;
+  clicking a chart jumps to that time. Frames are matched to log rows by
+  step number.
+- Each frame is translated so its centre of mass is at the origin, keeping a
+  drifting molecule in view (`--no-center` for lab-frame positions).
+  Trajectories longer than `--max-frames` (2000) are thinned by raising the
+  stride; `--every N` thins explicitly.
 
 ### `aimd backends`
 

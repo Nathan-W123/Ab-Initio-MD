@@ -7,6 +7,7 @@ Command-line interface (console script ``aimd``).
     aimd run water.xyz ... --checkpoint run.npz --checkpoint-every 50
     aimd run water.xyz ... --restart run.npz --steps 100  # continue
     aimd analyze ir dipoles.csv --temperature 300      # see aimd.cli_analyze
+    aimd view trajectory.xyz                           # HTML movie, see aimd.viewer
     aimd backends                                      # registered backends
 
 Units at this boundary: XYZ in angstrom, times in fs, temperatures in K,
@@ -201,6 +202,7 @@ def _add_run_parser(sub: argparse._SubParsersAction) -> argparse.ArgumentParser:
 
 def build_parser() -> argparse.ArgumentParser:
     from aimd.cli_analyze import add_analyze_parser
+    from aimd.viewer import add_view_parser
 
     p = argparse.ArgumentParser(prog="aimd", description="Ab initio molecular dynamics")
     sub = p.add_subparsers(dest="command", required=True)
@@ -208,6 +210,7 @@ def build_parser() -> argparse.ArgumentParser:
     b.set_defaults(func=cmd_backends)
     p.run_parser = _add_run_parser(sub)               # type: ignore[attr-defined]
     add_analyze_parser(sub)
+    add_view_parser(sub)
     return p
 
 
@@ -872,7 +875,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     try:
         tokens = _expand_config(tokens, parser)
         args = parser.parse_args(tokens)
-        if args.command == "analyze":
+        if args.command in ("analyze", "view"):
             try:
                 return int(args.func(args))
             except ValueError as e:                    # unreadable / unsuitable input
